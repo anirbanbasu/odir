@@ -1,9 +1,10 @@
+use directories::ProjectDirs;
 use log::{LevelFilter, info};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Settings for connecting to the Ollama server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,16 +83,16 @@ impl AppSettings {
     ///
     /// # Returns
     /// * `Result<Self, io::Error>` - The loaded or created settings
-    pub fn load_or_create_default(settings_file: &str) -> io::Result<Self> {
-        match Self::load_settings(settings_file) {
+    pub fn load_or_create_default<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
+        match Self::load_settings(&settings_file) {
             Ok(settings) => Ok(settings),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 info!(
                     "Settings file '{}' not found, creating with default values",
-                    settings_file
+                    settings_file.as_ref().display()
                 );
                 let settings = Self::default();
-                settings.save_settings(settings_file)?;
+                settings.save_settings(&settings_file)?;
                 Ok(settings)
             }
             Err(e) => Err(e),
@@ -105,7 +106,7 @@ impl AppSettings {
     ///
     /// # Returns
     /// * `Result<Self, io::Error>` - The loaded settings or an error
-    pub fn load_settings(settings_file: &str) -> io::Result<Self> {
+    pub fn load_settings<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
         let content = fs::read_to_string(settings_file)?;
         serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
@@ -117,9 +118,10 @@ impl AppSettings {
     ///
     /// # Returns
     /// * `Result<(), io::Error>` - Success or error
-    pub fn save_settings(&self, settings_file: &str) -> io::Result<()> {
+    pub fn save_settings<P: AsRef<Path>>(&self, settings_file: P) -> io::Result<()> {
+        let settings_path = settings_file.as_ref();
         // Create parent directory if it doesn't exist
-        if let Some(parent) = Path::new(settings_file).parent()
+        if let Some(parent) = settings_path.parent()
             && !parent.as_os_str().is_empty()
             && !parent.exists()
         {
@@ -127,7 +129,7 @@ impl AppSettings {
         }
 
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(settings_file, json)?;
+        fs::write(settings_path, json)?;
         Ok(())
     }
 }
@@ -141,9 +143,6 @@ pub struct Config {
     /// Log level for the application (default: INFO)
     pub log_level: LevelFilter,
 
-    /// Path to the settings file (default: odir-settings.json)
-    pub settings_file: String,
-
     /// User agent string for HTTP requests (default: odir/<version>)
     pub user_agent: String,
 }
@@ -152,7 +151,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             log_level: LevelFilter::Info,
-            settings_file: "odir-settings.json".to_string(),
             user_agent: format!("odir/{}", env!("CARGO_PKG_VERSION")),
         }
     }
@@ -168,11 +166,6 @@ impl Config {
         // Load log level from ODIR_LOG_LEVEL or OD_LOG_LEVEL
         if let Ok(level) = Self::get_env_with_fallback("ODIR_LOG_LEVEL", "OD_LOG_LEVEL") {
             config.log_level = Self::parse_log_level(&level);
-        }
-
-        // Load settings file from ODIR_SETTINGS_FILE or OD_SETTINGS_FILE
-        if let Ok(path) = Self::get_env_with_fallback("ODIR_SETTINGS_FILE", "OD_SETTINGS_FILE") {
-            config.settings_file = path;
         }
 
         // Load user agent from ODIR_UA_NAME_VER or OD_UA_NAME_VER
@@ -208,6 +201,34 @@ impl Config {
     }
 }
 
+/// Get the path to the settings file using OS-standard user config directories.
+///
+/// Returns the path to `settings.json` in the user's config directory.
+/// On Linux: `~/.config/odir/settings.json`
+/// On macOS: `~/Library/Application Support/odir/settings.json`
+/// On Windows: `C:\Users\<user>\AppData\Roaming\odir\settings.json`
+///
+/// Creates the config directory if it doesn't exist.
+///
+/// # Returns
+/// * `PathBuf` - Path to the settings file
+///
+/// # Panics
+/// Panics if the config directory cannot be determined or created.
+pub fn get_settings_file_path() -> PathBuf {
+    let proj_dirs =
+        ProjectDirs::from("", "", "odir").expect("Failed to determine config directory");
+
+    let config_dir = proj_dirs.config_dir();
+
+    // Create the directory if it doesn't exist
+    if let Err(e) = fs::create_dir_all(config_dir) {
+        panic!("Failed to create config directory: {}", e);
+    }
+
+    config_dir.join("settings.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,7 +238,6 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.log_level, LevelFilter::Info);
-        assert_eq!(config.settings_file, "odir-settings.json");
         assert!(config.user_agent.starts_with("odir/"));
     }
 

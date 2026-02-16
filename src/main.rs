@@ -1,6 +1,7 @@
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn};
+use std::io::{self, Write};
 
 mod config;
 use config::{AppSettings, Config};
@@ -91,6 +92,12 @@ enum Commands {
         /// <username>/<repository>:<quantisation>, e.g., bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M.
         user_repo_quant: String,
     },
+
+    /// Copies a Ollama Downloader settings file to the ODIR settings location.
+    OdCopySettings {
+        /// Path to the existing Ollama Downloader settings file.
+        od_settings_file: String,
+    },
 }
 
 fn main() {
@@ -103,32 +110,38 @@ fn main() {
         .init();
 
     debug!(
-        "Configuration loaded: log_level={:?}, settings_file={}, user_agent={}",
-        config.log_level, config.settings_file, config.user_agent
+        "Configuration loaded: log_level={:?}, user_agent={}",
+        config.log_level, config.user_agent
     );
 
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::ShowConfig => match AppSettings::load_or_create_default(&config.settings_file) {
-            Ok(settings) => match serde_json::to_string_pretty(&settings) {
-                Ok(json) => {
-                    println!("{}", json);
-                    info!("Settings loaded from {}", config.settings_file);
-                }
+        Commands::ShowConfig => {
+            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+                Ok(settings) => match serde_json::to_string_pretty(&settings) {
+                    Ok(json) => {
+                        println!("{}", json);
+                        info!(
+                            "Settings loaded from {:?}",
+                            config::get_settings_file_path()
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize settings: {}", e);
+                        std::process::exit(1);
+                    }
+                },
                 Err(e) => {
-                    error!("Failed to serialize settings: {}", e);
+                    error!(
+                        "Failed to load or create settings file '{:?}': {}",
+                        config::get_settings_file_path(),
+                        e
+                    );
                     std::process::exit(1);
                 }
-            },
-            Err(e) => {
-                error!(
-                    "Failed to load or create settings file '{}': {}",
-                    config.settings_file, e
-                );
-                std::process::exit(1);
             }
-        },
+        }
         Commands::AutoConfig => {
             warn!(
                 "Automatic configuration is an experimental feature. Its output maybe incorrect!"
@@ -199,7 +212,7 @@ fn main() {
             }
         }
         Commands::ListModels { page, page_size } => {
-            match AppSettings::load_or_create_default(&config.settings_file) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
                 Ok(settings) => match OllamaModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.list_available_models(page, page_size) {
                         Ok(models) => {
@@ -231,7 +244,7 @@ fn main() {
             }
         }
         Commands::ListTags { model_identifier } => {
-            match AppSettings::load_or_create_default(&config.settings_file) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
                 Ok(settings) => match OllamaModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
                         Ok(tags) => {
@@ -254,7 +267,7 @@ fn main() {
             }
         }
         Commands::ModelDownload { model_tag } => {
-            match AppSettings::load_or_create_default(&config.settings_file) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
                 Ok(settings) => match OllamaModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.download_model(&model_tag) {
                         Ok(_) => {
@@ -277,7 +290,7 @@ fn main() {
             }
         }
         Commands::HfListModels { page, page_size } => {
-            match AppSettings::load_or_create_default(&config.settings_file) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
                 Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
                     Ok(downloader) => {
                         match downloader.list_available_models(Some(page), Some(page_size)) {
@@ -307,7 +320,7 @@ fn main() {
             }
         }
         Commands::HfListTags { model_identifier } => {
-            match AppSettings::load_or_create_default(&config.settings_file) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
                 Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
                         Ok(tags) => {
@@ -333,7 +346,7 @@ fn main() {
             }
         }
         Commands::HfModelDownload { user_repo_quant } => {
-            match AppSettings::load_or_create_default(&config.settings_file) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
                 Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.download_model(&user_repo_quant) {
                         Ok(_) => {
@@ -357,6 +370,71 @@ fn main() {
                 },
                 Err(e) => {
                     error!("Failed to load settings: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::OdCopySettings { od_settings_file } => {
+            use std::fs;
+            use std::path::Path;
+
+            let source_path = Path::new(&od_settings_file);
+            let dest_path = config::get_settings_file_path();
+
+            // Check if source file exists
+            if !source_path.exists() {
+                error!("Source settings file does not exist: {}", od_settings_file);
+                std::process::exit(1);
+            }
+
+            // Check if source file is readable
+            if let Err(e) = fs::metadata(source_path) {
+                error!(
+                    "Cannot access source settings file '{}': {}",
+                    od_settings_file, e
+                );
+                std::process::exit(1);
+            }
+
+            // Check if destination file already exists
+            if dest_path.exists() {
+                println!("Settings file already exists at: {}", dest_path.display());
+                print!("Overwrite existing settings file? [y/N]: ");
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                if let Err(e) = io::stdin().read_line(&mut input) {
+                    error!("Failed to read user input: {}", e);
+                    std::process::exit(1);
+                }
+
+                let input = input.trim().to_lowercase();
+                if input != "y" && input != "yes" {
+                    info!("Operation cancelled by user.");
+                    return;
+                }
+            }
+
+            // Copy the file
+            match fs::copy(source_path, &dest_path) {
+                Ok(_) => {
+                    info!(
+                        "Successfully copied settings from '{}' to '{}'",
+                        od_settings_file,
+                        dest_path.display()
+                    );
+                    println!(
+                        "Settings file copied successfully to: {}",
+                        dest_path.display()
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to copy settings from '{}' to '{}': {}",
+                        od_settings_file,
+                        dest_path.display(),
+                        e
+                    );
                     std::process::exit(1);
                 }
             }

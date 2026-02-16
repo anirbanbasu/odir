@@ -79,3 +79,9 @@ count-lines:
     @echo "Counting lines of code and documentation..."
     @tokei --hidden --exclude target
     @echo "Line count complete."
+
+# Run the Open Source Vulnerability scanner
+vulnerability-scan:
+    @echo "Running Open Source Vulnerability scanner..."
+    @osv-scanner scan source -r .
+    @echo "Vulnerability scan complete."
