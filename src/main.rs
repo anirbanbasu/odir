@@ -1,5 +1,9 @@
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
+use log::debug;
+
+mod config;
+use config::Config;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -84,6 +88,19 @@ enum Commands {
 }
 
 fn main() {
+    // Initialize configuration from environment variables
+    let config = Config::from_env();
+
+    // Initialize logger with the configured log level
+    env_logger::Builder::new()
+        .filter_level(config.log_level)
+        .init();
+
+    debug!(
+        "Configuration loaded: log_level={:?}, settings_file={}, user_agent={}",
+        config.log_level, config.settings_file, config.user_agent
+    );
+
     let cli = Cli::parse();
 
     match cli.command {
