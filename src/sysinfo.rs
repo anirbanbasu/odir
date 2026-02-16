@@ -3,7 +3,7 @@ use regex::Regex;
 use std::env;
 use std::path::PathBuf;
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use users::{get_group_by_gid, get_user_by_uid};
+use uzers::{get_group_by_gid, get_user_by_uid};
 
 const PROCESS_NAME: &str = "ollama";
 
