@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -133,12 +133,20 @@ impl HuggingFaceModelDownloader {
             &named_digest[named_digest.len().saturating_sub(4)..]
         ));
 
-        let bytes = response.bytes()?;
+        // Stream chunks from the response
+        let mut response_reader = response;
+        let mut buffer = [0u8; 8192];
 
-        for chunk in bytes.chunks(8192) {
+        loop {
+            let bytes_read = response_reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk = &buffer[..bytes_read];
             hasher.update(chunk);
             temp_file.write_all(chunk)?;
-            pb.inc(chunk.len() as u64);
+            pb.inc(bytes_read as u64);
         }
 
         pb.finish_with_message("Downloaded");
