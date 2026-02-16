@@ -25,7 +25,7 @@ const STYLES: Styles = Styles::styled()
 #[derive(Parser)]
 #[command(name = "odir")]
 #[command(version, about)]
-#[command(disable_help_subcommand = true)]
+// #[command(disable_help_subcommand = false)]
 #[command(styles = STYLES)]
 #[command(override_usage = "odir [OPTIONS] <COMMAND> [ARGS]...")]
 struct Cli {
@@ -35,12 +35,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(subcommand_help_heading = "Configuration")]
     /// Shows the application configuration as JSON.
     ShowConfig,
 
+    #[command(subcommand_help_heading = "Configuration")]
     /// Displays an automatically inferred configuration.
     AutoConfig,
 
+    #[command(subcommand_help_heading = "Ollama Library")]
     /// Lists all available models in the Ollama library.
     ///
     /// If pagination options are not provided, all models will be listed.
@@ -54,12 +57,14 @@ enum Commands {
         page_size: Option<u32>,
     },
 
+    #[command(subcommand_help_heading = "Ollama Library")]
     /// Lists all tags for a specific model.
     ListTags {
         /// The name of the model to list tags for, e.g., llama3.1.
         model_identifier: String,
     },
 
+    #[command(subcommand_help_heading = "Ollama Library")]
     /// Downloads a specific Ollama model with the given tag.
     ModelDownload {
         /// The name of the model and a specific tag to download, specified as <model>:<tag>,
@@ -67,6 +72,7 @@ enum Commands {
         model_tag: String,
     },
 
+    #[command(subcommand_help_heading = "Hugging Face Models")]
     /// Lists available models from Hugging Face that can be downloaded into Ollama.
     HfListModels {
         /// The page number to retrieve (1-indexed).
@@ -78,6 +84,7 @@ enum Commands {
         page_size: u32,
     },
 
+    #[command(subcommand_help_heading = "Hugging Face Models")]
     /// Lists all available quantisations as tags for a Hugging Face model that can be downloaded into Ollama.
     ///
     /// Note that these are NOT the same as Hugging Face model tags.
@@ -86,6 +93,7 @@ enum Commands {
         model_identifier: String,
     },
 
+    #[command(subcommand_help_heading = "Hugging Face Models")]
     /// Downloads a specified Hugging Face model.
     HfModelDownload {
         /// The name of the specific Hugging Face model to download, specified as
@@ -93,6 +101,7 @@ enum Commands {
         user_repo_quant: String,
     },
 
+    #[command(subcommand_help_heading = "Compatibility")]
     /// Copies a Ollama Downloader settings file to the ODIR settings location.
     OdCopySettings {
         /// Path to the existing Ollama Downloader settings file.
