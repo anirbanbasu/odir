@@ -1,0 +1,94 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+# A sample workflow which sets up periodic OSV-Scanner scanning for vulnerabilities,
+# in addition to a PR check which fails if new vulnerabilities are introduced.
+#
+# For more examples and options, including how to ignore specific vulnerabilities,
+# see https://google.github.io/osv-scanner/github-action/
+
+name: OSV-Scanner
+
+on:
+    pull_request:
+        branches: ["master"]
+    merge_group:
+        branches: ["master"]
+    schedule:
+        - cron: "31 17 * * 0"
+    push:
+        branches: ["master"]
+
+permissions:
+    contents: read
+
+jobs:
+    scan-scheduled:
+        if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+        runs-on: ubuntu-latest
+        permissions:
+            # Required to upload SARIF file to security tab
+            security-events: write
+            # Required to read commit contents
+            contents: read
+        steps:
+            - name: Harden the runner (Audit all outbound calls)
+              uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+              with:
+                  egress-policy: audit
+
+            - name: Checkout repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Run OSV-Scanner
+              uses: google/osv-scanner-action/osv-scanner-action@2a387edfbe02a11d856b89172f6e978100177eb4 # v2.3.2
+              with:
+                  scan-args: |-
+                      -r
+                      --format sarif
+                      --output results.sarif
+                      ./
+              continue-on-error: true # This is necessary to report when vulnerabilities are found
+
+            - name: Upload SARIF file
+              uses: github/codeql-action/upload-sarif@77591e2c4a43bf190ac768983419eb058187e62f # v2.24.1
+              with:
+                  sarif_file: results.sarif
+              if: success() || failure()
+
+    scan-pr:
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+        runs-on: ubuntu-latest
+        permissions:
+            # Required to upload SARIF file to security tab
+            security-events: write
+            # Required to read commit contents
+            contents: read
+        steps:
+            - name: Harden the runner (Audit all outbound calls)
+              uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+              with:
+                  egress-policy: audit
+
+            - name: Checkout repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  fetch-depth: 0
+
+            - name: Run OSV-Scanner (compare mode for PRs)
+              uses: google/osv-scanner-action/osv-scanner-action@2a387edfbe02a11d856b89172f6e978100177eb4 # v2.3.2
+              with:
+                  scan-args: |-
+                      -r
+                      --format sarif
+                      --output results.sarif
+                      ./
+              continue-on-error: true # This is necessary to report when vulnerabilities are found
+
+            - name: Upload SARIF file
+              uses: github/codeql-action/upload-sarif@77591e2c4a43bf190ac768983419eb058187e62f # v2.24.1
+              with:
+                  sarif_file: results.sarif
+              if: success() || failure()

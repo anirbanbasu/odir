@@ -1,0 +1,61 @@
+repos:
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        description: Format Rust code with rustfmt
+        args: ["--manifest-path=Cargo.toml", "--"]
+      - id: cargo-check
+        name: cargo check
+        description: Check Rust code for compilation errors
+        args: ["--manifest-path=Cargo.toml", "--all-features"]
+      - id: clippy
+        name: cargo clippy
+        description: Lint Rust code with clippy
+        args:
+          [
+            "--manifest-path=Cargo.toml",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+          ]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+        name: Check YAML files
+      - id: check-toml
+        name: Check TOML files
+      - id: check-json
+        name: Check JSON files
+      - id: destroyed-symlinks
+        name: Check for broken symlinks
+      - id: detect-private-key
+        name: Detect private keys
+      - id: mixed-line-ending
+        name: Check for mixed line endings
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+      - id: end-of-file-fixer
+        name: Fix end of files
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+        args: [--markdown-linebreak-ext=md]
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.20.0
+    hooks:
+      - id: markdownlint-cli2
+        name: Markdown Lint
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        name: YAML Lint
+        args: ["-c", ".yamllint"]
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks

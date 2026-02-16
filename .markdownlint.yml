@@ -1,0 +1,25 @@
+default: true
+
+# Allow multiple blank lines
+#
+# Reason: Sometimes multiple blank lines improve readability, e.g., between sections, or for adding HTML comments to Markdown. ADR templates have this. Also, certain pre-commit hooks add an extra line at the end of a file.
+#
+# Details: https://github.com/DavidAnson/markdownlint/blob/main/doc/md012.md#md012---multiple-consecutive-blank-lines
+MD012: false
+
+# Allow arbitrary line length
+#
+# Reason: We apply the one-sentence-per-line rule. A sentence may get longer than 80 characters, especially if links are contained.
+#
+# Details: https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md#md013---line-length
+MD013: false
+
+# Allow duplicate headings
+#
+# Reasons:
+#
+# - The chosen option is considerably often used as title of the ADR. Thus, that title repeats.
+# - Markdown lint should support the user and not annoy them.
+#
+# Details: https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md#md024---multiple-headings-with-the-same-content
+MD024: false
