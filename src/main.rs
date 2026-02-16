@@ -5,6 +5,9 @@ use log::{debug, error, info};
 mod config;
 use config::{AppSettings, Config};
 
+mod downloader;
+use downloader::{HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader};
+
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .usage(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
@@ -127,34 +130,167 @@ fn main() {
             eprintln!("auto-config: Not yet implemented");
         }
         Commands::ListModels { page, page_size } => {
-            eprintln!("list-models: Not yet implemented");
-            if let Some(p) = page {
-                eprintln!("  page: {}", p);
-            }
-            if let Some(ps) = page_size {
-                eprintln!("  page_size: {}", ps);
+            match AppSettings::load_or_create_default(&config.settings_file) {
+                Ok(settings) => match OllamaModelDownloader::new(settings) {
+                    Ok(downloader) => match downloader.list_available_models(page, page_size) {
+                        Ok(models) => {
+                            if let (Some(p), Some(_ps)) = (page, page_size) {
+                                println!(
+                                    "Model identifiers: ({}, page {}): {:?}",
+                                    models.len(),
+                                    p,
+                                    models
+                                );
+                            } else {
+                                println!("Model identifiers: ({}): {:?}", models.len(), models);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error listing models: {}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to create Ollama downloader: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
         Commands::ListTags { model_identifier } => {
-            eprintln!("list-tags: Not yet implemented");
-            eprintln!("  model_identifier: {}", model_identifier);
+            match AppSettings::load_or_create_default(&config.settings_file) {
+                Ok(settings) => match OllamaModelDownloader::new(settings) {
+                    Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
+                        Ok(tags) => {
+                            println!("Model tags: ({} tags): {:?}", tags.len(), tags);
+                        }
+                        Err(e) => {
+                            error!("Error listing tags for model '{}': {}", model_identifier, e);
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to create Ollama downloader: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::ModelDownload { model_tag } => {
-            eprintln!("model-download: Not yet implemented");
-            eprintln!("  model_tag: {}", model_tag);
+            match AppSettings::load_or_create_default(&config.settings_file) {
+                Ok(settings) => match OllamaModelDownloader::new(settings) {
+                    Ok(downloader) => match downloader.download_model(&model_tag) {
+                        Ok(_) => {
+                            println!("Model {} download completed successfully", model_tag);
+                        }
+                        Err(e) => {
+                            error!("Error downloading model '{}': {}", model_tag, e);
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to create Ollama downloader: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::HfListModels { page, page_size } => {
-            eprintln!("hf-list-models: Not yet implemented");
-            eprintln!("  page: {}", page);
-            eprintln!("  page_size: {}", page_size);
+            match AppSettings::load_or_create_default(&config.settings_file) {
+                Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
+                    Ok(downloader) => {
+                        match downloader.list_available_models(Some(page), Some(page_size)) {
+                            Ok(models) => {
+                                println!(
+                                    "Model identifiers: ({}, page {}): {:?}",
+                                    models.len(),
+                                    page,
+                                    models
+                                );
+                            }
+                            Err(e) => {
+                                error!("Error listing HuggingFace models: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to create HuggingFace downloader: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::HfListTags { model_identifier } => {
-            eprintln!("hf-list-tags: Not yet implemented");
-            eprintln!("  model_identifier: {}", model_identifier);
+            match AppSettings::load_or_create_default(&config.settings_file) {
+                Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
+                    Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
+                        Ok(tags) => {
+                            println!("Model tags: ({} tags): {:?}", tags.len(), tags);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Error listing tags for HuggingFace model '{}': {}",
+                                model_identifier, e
+                            );
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to create HuggingFace downloader: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::HfModelDownload { user_repo_quant } => {
-            eprintln!("hf-model-download: Not yet implemented");
-            eprintln!("  user_repo_quant: {}", user_repo_quant);
+            match AppSettings::load_or_create_default(&config.settings_file) {
+                Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
+                    Ok(downloader) => match downloader.download_model(&user_repo_quant) {
+                        Ok(_) => {
+                            println!(
+                                "HuggingFace model {} download completed successfully",
+                                user_repo_quant
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Error downloading HuggingFace model '{}': {}",
+                                user_repo_quant, e
+                            );
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to create HuggingFace downloader: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
