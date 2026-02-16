@@ -1,9 +1,9 @@
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
-use log::debug;
+use log::{debug, error, info};
 
 mod config;
-use config::Config;
+use config::{AppSettings, Config};
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -104,9 +104,25 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::ShowConfig => {
-            eprintln!("show-config: Not yet implemented");
-        }
+        Commands::ShowConfig => match AppSettings::load_or_create_default(&config.settings_file) {
+            Ok(settings) => match serde_json::to_string_pretty(&settings) {
+                Ok(json) => {
+                    println!("{}", json);
+                    info!("Settings loaded from {}", config.settings_file);
+                }
+                Err(e) => {
+                    error!("Failed to serialize settings: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                error!(
+                    "Failed to load or create settings file '{}': {}",
+                    config.settings_file, e
+                );
+                std::process::exit(1);
+            }
+        },
         Commands::AutoConfig => {
             eprintln!("auto-config: Not yet implemented");
         }
