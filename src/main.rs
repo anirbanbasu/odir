@@ -1,12 +1,15 @@
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 mod config;
 use config::{AppSettings, Config};
 
 mod downloader;
 use downloader::{HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader};
+
+mod sysinfo;
+use sysinfo::OllamaSystemInfo;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -127,7 +130,73 @@ fn main() {
             }
         },
         Commands::AutoConfig => {
-            eprintln!("auto-config: Not yet implemented");
+            warn!(
+                "Automatic configuration is an experimental feature. Its output maybe incorrect!"
+            );
+
+            let mut system_info = OllamaSystemInfo::new();
+
+            if system_info.is_windows() {
+                error!("Automatic configuration is not supported on Windows yet.");
+                std::process::exit(1);
+            }
+
+            // Check if Ollama is running
+            if !system_info.is_running() {
+                error!("Ollama process not found. Make sure Ollama is running.");
+                std::process::exit(1);
+            }
+
+            let listening_on = system_info.infer_listening_on();
+            let models_dir_path = system_info.infer_models_dir_path();
+
+            let mut super_user_maybe_needed = false;
+            super_user_maybe_needed = super_user_maybe_needed
+                || listening_on.is_none()
+                || listening_on == Some("".to_string());
+            super_user_maybe_needed = super_user_maybe_needed
+                || models_dir_path.is_none()
+                || models_dir_path == Some("".to_string());
+
+            if super_user_maybe_needed {
+                error!(
+                    "Automatic configuration could not infer some settings. Maybe super-user permissions are necessary. Or, perhaps, Ollama has no models installed yet."
+                );
+                std::process::exit(1);
+            } else {
+                let mut inferred_settings = AppSettings::default();
+
+                if let Some(url) = listening_on {
+                    inferred_settings.ollama_server.url = url;
+                }
+
+                if let Some(path) = models_dir_path {
+                    inferred_settings.ollama_library.models_path = path;
+                }
+
+                if system_info.is_likely_daemon() {
+                    if system_info.is_macos() {
+                        warn!(
+                            "Automatic configuration on macOS maybe flawed if Ollama is configured to run as a system background service."
+                        );
+                    }
+
+                    if let Some(owner) = system_info.get_process_owner() {
+                        inferred_settings.ollama_library.user_group =
+                            Some((owner.username.clone(), owner.groupname.clone()));
+                    }
+                }
+
+                match serde_json::to_string_pretty(&inferred_settings) {
+                    Ok(json) => {
+                        println!("{}", json);
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize inferred settings: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
         Commands::ListModels { page, page_size } => {
             match AppSettings::load_or_create_default(&config.settings_file) {
