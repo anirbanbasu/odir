@@ -142,16 +142,12 @@ impl AppSettings {
 pub struct Config {
     /// Log level for the application (default: INFO)
     pub log_level: LevelFilter,
-
-    /// User agent string for HTTP requests (default: odir/<version>)
-    pub user_agent: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             log_level: LevelFilter::Info,
-            user_agent: format!("odir/{}", env!("CARGO_PKG_VERSION")),
         }
     }
 }
@@ -166,11 +162,6 @@ impl Config {
         // Load log level from ODIR_LOG_LEVEL or OD_LOG_LEVEL
         if let Ok(level) = Self::get_env_with_fallback("ODIR_LOG_LEVEL", "OD_LOG_LEVEL") {
             config.log_level = Self::parse_log_level(&level);
-        }
-
-        // Load user agent from ODIR_UA_NAME_VER or OD_UA_NAME_VER
-        if let Ok(ua) = Self::get_env_with_fallback("ODIR_UA_NAME_VER", "OD_UA_NAME_VER") {
-            config.user_agent = ua;
         }
 
         config
@@ -229,6 +220,16 @@ pub fn get_settings_file_path() -> PathBuf {
     config_dir.join("settings.json")
 }
 
+/// Get the user agent string for HTTP requests.
+///
+/// Returns a string in the format "odir/<version>".
+///
+/// # Returns
+/// * `String` - User agent string
+pub fn get_user_agent() -> String {
+    format!("odir/{}", env!("CARGO_PKG_VERSION"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,7 +239,12 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.log_level, LevelFilter::Info);
-        assert!(config.user_agent.starts_with("odir/"));
+    }
+
+    #[test]
+    fn test_get_user_agent() {
+        let user_agent = get_user_agent();
+        assert!(user_agent.starts_with("odir/"));
     }
 
     #[test]

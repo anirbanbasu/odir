@@ -119,8 +119,10 @@ fn main() {
         .init();
 
     debug!(
-        "Configuration loaded: log_level={:?}, user_agent={}",
-        config.log_level, config.user_agent
+        "Configuration loaded: log_level={:?}, user_agent={}, settings_file={:?}",
+        config.log_level,
+        config::get_user_agent(),
+        config::get_settings_file_path()
     );
 
     let cli = Cli::parse();
