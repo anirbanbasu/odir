@@ -2,6 +2,7 @@ use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn};
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 mod config;
 use config::{AppSettings, Config};
@@ -42,6 +43,18 @@ enum Commands {
     #[command(subcommand_help_heading = "Configuration")]
     /// Displays an automatically inferred configuration.
     AutoConfig,
+
+    #[command(subcommand_help_heading = "Configuration")]
+    /// Interactively edits application settings through step-by-step questions.
+    ///
+    /// If a settings file already exists, the current values will be shown as defaults.
+    /// Otherwise, the default configuration values will be used.
+    EditConfig {
+        /// Optional configuration file path to edit.
+        /// If not provided, uses the default user settings location.
+        #[arg(long, short)]
+        config_file: Option<String>,
+    },
 
     #[command(subcommand_help_heading = "Ollama Library")]
     /// Lists all available models in the Ollama library.
@@ -107,6 +120,242 @@ enum Commands {
         /// Path to the existing Ollama Downloader settings file.
         od_settings_file: String,
     },
+}
+
+/// Prompts the user for a string input with a default value.
+///
+/// # Arguments
+/// * `prompt` - The prompt message to display
+/// * `default` - The default value if user presses Enter without input
+///
+/// # Returns
+/// * `String` - The user's input or the default value
+fn prompt_string(prompt: &str, default: &str) -> String {
+    print!("{} [{}]: ", prompt, default);
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    let input = input.trim();
+
+    if input.is_empty() {
+        default.to_string()
+    } else {
+        input.to_string()
+    }
+}
+
+/// Prompts the user for an optional string input.
+///
+/// # Arguments
+/// * `prompt` - The prompt message to display
+///
+/// # Returns
+/// * `Option<String>` - Some(input) if provided, None if empty
+fn prompt_optional_string(prompt: &str) -> Option<String> {
+    print!("{} (press Enter to skip): ", prompt);
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    let input = input.trim();
+
+    if input.is_empty() {
+        None
+    } else {
+        Some(input.to_string())
+    }
+}
+
+/// Prompts the user for a boolean (yes/no) input with a default value.
+///
+/// # Arguments
+/// * `prompt` - The prompt message to display
+/// * `default` - The default value if user presses Enter without input
+///
+/// # Returns
+/// * `bool` - The user's selection or the default value
+fn prompt_bool(prompt: &str, default: bool) -> bool {
+    let default_str = if default { "Y/n" } else { "y/N" };
+    print!("{} [{}]: ", prompt, default_str);
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    let input = input.trim().to_lowercase();
+
+    if input.is_empty() {
+        default
+    } else {
+        matches!(input.as_str(), "y" | "yes")
+    }
+}
+
+/// Prompts the user for a floating-point number with a default value.
+///
+/// # Arguments
+/// * `prompt` - The prompt message to display
+/// * `default` - The default value if user presses Enter without input
+///
+/// # Returns
+/// * `f64` - The user's input or the default value
+fn prompt_f64(prompt: &str, default: f64) -> f64 {
+    loop {
+        print!("{} [{}]: ", prompt, default);
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let input = input.trim();
+
+        if input.is_empty() {
+            return default;
+        }
+
+        match input.parse::<f64>() {
+            Ok(value) => return value,
+            Err(_) => {
+                println!("Invalid number. Please try again.");
+            }
+        }
+    }
+}
+
+/// Prompts the user for an optional username and group pair.
+///
+/// # Arguments
+/// * `prompt` - The prompt message to display
+///
+/// # Returns
+/// * `Option<(String, String)>` - Some((user, group)) if provided, None if skipped
+fn prompt_user_group(prompt: &str) -> Option<(String, String)> {
+    println!("{}", prompt);
+    let username = prompt_optional_string("  Username");
+
+    if let Some(user) = username {
+        let groupname = prompt_optional_string("  Group name");
+        if let Some(group) = groupname {
+            return Some((user, group));
+        } else {
+            println!("Both username and group are required. Skipping user/group configuration.");
+            return None;
+        }
+    }
+
+    None
+}
+
+/// Interactively configures application settings by prompting the user.
+///
+/// # Arguments
+/// * `existing_settings` - Existing settings to use as defaults, or None for default values
+///
+/// # Returns
+/// * `AppSettings` - The configured settings
+fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
+    println!("\n=== Interactive Configuration ===\n");
+
+    let has_existing = existing_settings.is_some();
+    let mut settings = existing_settings.unwrap_or_default();
+
+    if has_existing {
+        println!("Editing existing configuration. Press Enter to keep current values.\n");
+    } else {
+        println!("Creating new configuration. Press Enter to accept default values.\n");
+    }
+
+    // Ollama Server settings
+    println!("--- Ollama Server Settings ---");
+    let current_url = settings.ollama_server.url.clone();
+    settings.ollama_server.url = prompt_string("Ollama server URL", &current_url);
+
+    // For API key, show current value or indicate it's optional
+    let current_api_key = settings.ollama_server.api_key.clone();
+    if let Some(ref current_key) = current_api_key {
+        println!("Ollama API key (current: {})", current_key);
+        settings.ollama_server.api_key =
+            prompt_optional_string("  Enter new API key or press Enter to keep current");
+        if settings.ollama_server.api_key.is_none() {
+            settings.ollama_server.api_key = Some(current_key.clone());
+        }
+    } else {
+        settings.ollama_server.api_key = prompt_optional_string("Ollama API key");
+    }
+
+    settings.ollama_server.remove_downloaded_on_error = prompt_bool(
+        "Remove downloaded files on error?",
+        settings.ollama_server.remove_downloaded_on_error,
+    );
+
+    // Ollama Library settings
+    println!("\n--- Ollama Library Settings ---");
+    settings.ollama_library.models_path =
+        prompt_string("Ollama models path", &settings.ollama_library.models_path);
+
+    settings.ollama_library.registry_base_url = prompt_string(
+        "Ollama registry base URL",
+        &settings.ollama_library.registry_base_url,
+    );
+
+    settings.ollama_library.library_base_url = prompt_string(
+        "Ollama library base URL",
+        &settings.ollama_library.library_base_url,
+    );
+
+    settings.ollama_library.verify_ssl = prompt_bool(
+        "Verify SSL certificates?",
+        settings.ollama_library.verify_ssl,
+    );
+
+    settings.ollama_library.timeout = prompt_f64(
+        "HTTP request timeout (seconds)",
+        settings.ollama_library.timeout,
+    );
+
+    // For user/group, handle existing or new configuration
+    let current_user_group = settings.ollama_library.user_group.clone();
+    if let Some((ref user, ref group)) = current_user_group {
+        println!(
+            "\nCurrent ownership for models directory: {}:{}",
+            user, group
+        );
+        print!("Do you want to (k)eep, (e)dit, or (r)emove this setting? [K/e/r]: ");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let choice = input.trim().to_lowercase();
+
+        match choice.as_str() {
+            "r" | "remove" => {
+                settings.ollama_library.user_group = None;
+                println!("User/group ownership removed.");
+            }
+            "e" | "edit" => {
+                println!("Enter new values:");
+                settings.ollama_library.user_group = prompt_user_group("");
+            }
+            _ => {
+                // Keep current (default)
+                println!("Keeping current user/group setting.");
+                settings.ollama_library.user_group = current_user_group;
+            }
+        }
+    } else {
+        print!("\nDo you want to set ownership for the models directory? [y/N]: ");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let choice = input.trim().to_lowercase();
+
+        if matches!(choice.as_str(), "y" | "yes") {
+            settings.ollama_library.user_group = prompt_user_group("");
+        }
+    }
+
+    println!("\n=== Configuration Complete ===\n");
+    settings
 }
 
 fn main() {
@@ -219,6 +468,66 @@ fn main() {
                         error!("Failed to serialize inferred settings: {}", e);
                         std::process::exit(1);
                     }
+                }
+            }
+        }
+        Commands::EditConfig { config_file } => {
+            // Determine config file path
+            let config_path = config_file
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(config::get_settings_file_path);
+
+            // Try to load existing settings from the config file
+            let existing_settings = if config_path.exists() {
+                match AppSettings::load_settings(&config_path) {
+                    Ok(settings) => {
+                        info!("Loaded existing settings from: {}", config_path.display());
+                        Some(settings)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Settings file exists but could not be loaded: {}. Using defaults.",
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                info!("No existing settings file found. Creating new configuration.");
+                None
+            };
+
+            // Interactively configure settings
+            let settings = interactive_config(existing_settings);
+
+            // Save settings to file
+            match settings.save_settings(&config_path) {
+                Ok(_) => {
+                    println!(
+                        "\n✓ Settings saved successfully to: {}",
+                        config_path.display()
+                    );
+                    info!("Settings saved to: {}", config_path.display());
+
+                    // Display the saved settings
+                    match serde_json::to_string_pretty(&settings) {
+                        Ok(json) => {
+                            println!("\nSaved configuration:");
+                            println!("{}", json);
+                        }
+                        Err(e) => {
+                            warn!("Failed to display saved settings: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to save settings to '{}': {}",
+                        config_path.display(),
+                        e
+                    );
+                    std::process::exit(1);
                 }
             }
         }
