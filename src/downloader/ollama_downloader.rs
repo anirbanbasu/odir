@@ -13,6 +13,60 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
+/// Check if a model is present in the Ollama server
+///
+/// # Arguments
+/// * `client` - HTTP client for making requests
+/// * `server_url` - Base URL of the Ollama server
+/// * `model` - Model name
+/// * `tag` - Model tag
+///
+/// # Returns
+/// * `Result<bool>` - True if model is present, false if not found, or error
+fn is_model_present_in_ollama(
+    client: &Client,
+    server_url: &str,
+    model: &str,
+    tag: &str,
+) -> Result<bool> {
+    let tags_url = format!("{}api/tags", server_url.trim_end_matches('/'));
+
+    debug!(
+        "Checking Ollama server for model {}:{} at {}",
+        model, tag, tags_url
+    );
+
+    let response = client.get(&tags_url).send()?;
+
+    if !response.status().is_success() {
+        return Err(DownloaderError::HttpError(
+            response.error_for_status().unwrap_err(),
+        ));
+    }
+
+    let tags_response: serde_json::Value = response.json()?;
+
+    // Parse the JSON response to check for the model
+    // Response format: {"models": [{"name": "model:tag", ...}]}
+    if let Some(models) = tags_response.get("models").and_then(|m| m.as_array()) {
+        for model_obj in models {
+            if let Some(name) = model_obj.get("name").and_then(|n| n.as_str())
+                && name == format!("{}:{}", model, tag)
+            {
+                debug!("Model {}:{} found in Ollama server", model, tag);
+                return Ok(true);
+            }
+        }
+        debug!("Model {}:{} not found in Ollama server", model, tag);
+        return Ok(false);
+    }
+
+    error!("Failed to parse Ollama tags response");
+    Err(DownloaderError::Other(
+        "Failed to parse Ollama tags response".to_string(),
+    ))
+}
+
 /// Downloader for Ollama library models
 pub struct OllamaModelDownloader {
     settings: AppSettings,
@@ -376,6 +430,43 @@ impl ModelDownloader for OllamaModelDownloader {
         self_mut.unnecessary_files.clear();
 
         println!("Model {}:{} successfully downloaded", model, tag);
+
+        // Verify the model is present in the Ollama server
+        info!(
+            "Verifying model {}:{} is present in Ollama server",
+            model, tag
+        );
+        let model_present = match is_model_present_in_ollama(
+            &self_mut.client,
+            &self.settings.ollama_server.url,
+            &model,
+            &tag,
+        ) {
+            Ok(present) => present,
+            Err(e) => {
+                error!("Failed to verify model with Ollama server: {}", e);
+                if self.settings.ollama_server.remove_downloaded_on_error {
+                    info!("Removing downloaded files due to verification failure");
+                    self_mut.cleanup_unnecessary_files();
+                }
+                return Err(e);
+            }
+        };
+
+        if !model_present {
+            let err_msg = format!(
+                "Model {}:{} not found in Ollama server after download",
+                model, tag
+            );
+            error!("{}", err_msg);
+            if self.settings.ollama_server.remove_downloaded_on_error {
+                info!("Removing downloaded files because model not found in Ollama server");
+                self_mut.cleanup_unnecessary_files();
+            }
+            return Err(DownloaderError::Other(err_msg));
+        }
+
+        info!("Model {}:{} verified in Ollama server", model, tag);
         Ok(true)
     }
 
