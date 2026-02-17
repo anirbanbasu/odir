@@ -214,30 +214,6 @@ fn prompt_f64(prompt: &str, default: f64) -> f64 {
     }
 }
 
-/// Prompts the user for an optional username and group pair.
-///
-/// # Arguments
-/// * `prompt` - The prompt message to display
-///
-/// # Returns
-/// * `Option<(String, String)>` - Some((user, group)) if provided, None if skipped
-fn prompt_user_group(prompt: &str) -> Option<(String, String)> {
-    println!("{}", prompt);
-    let username = prompt_optional_string("  Username");
-
-    if let Some(user) = username {
-        let groupname = prompt_optional_string("  Group name");
-        if let Some(group) = groupname {
-            return Some((user, group));
-        } else {
-            println!("Both username and group are required. Skipping user/group configuration.");
-            return None;
-        }
-    }
-
-    None
-}
-
 /// Interactively configures application settings by prompting the user.
 ///
 /// # Arguments
@@ -309,48 +285,6 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
         "HTTP request timeout (seconds)",
         settings.ollama_library.timeout,
     );
-
-    // For user/group, handle existing or new configuration
-    let current_user_group = settings.ollama_library.user_group.clone();
-    if let Some((ref user, ref group)) = current_user_group {
-        println!(
-            "\nCurrent ownership for models directory: {}:{}",
-            user, group
-        );
-        print!("Do you want to (k)eep, (e)dit, or (r)emove this setting? [K/e/r]: ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let choice = input.trim().to_lowercase();
-
-        match choice.as_str() {
-            "r" | "remove" => {
-                settings.ollama_library.user_group = None;
-                println!("User/group ownership removed.");
-            }
-            "e" | "edit" => {
-                println!("Enter new values:");
-                settings.ollama_library.user_group = prompt_user_group("");
-            }
-            _ => {
-                // Keep current (default)
-                println!("Keeping current user/group setting.");
-                settings.ollama_library.user_group = current_user_group;
-            }
-        }
-    } else {
-        print!("\nDo you want to set ownership for the models directory? [y/N]: ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let choice = input.trim().to_lowercase();
-
-        if matches!(choice.as_str(), "y" | "yes") {
-            settings.ollama_library.user_group = prompt_user_group("");
-        }
-    }
 
     println!("\n=== Configuration Complete ===\n");
     settings

@@ -2,8 +2,8 @@ use crate::config::AppSettings;
 use crate::downloader::manifest::ImageManifest;
 use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};
 use crate::downloader::utils::{
-    cleanup_unnecessary_files, download_model_blob, expand_models_path, is_model_present_in_ollama,
-    save_blob, save_manifest,
+    Ownership, cleanup_unnecessary_files, download_model_blob, expand_models_path,
+    infer_models_dir_ownership, is_model_present_in_ollama, save_blob, save_manifest,
 };
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
@@ -36,6 +36,7 @@ pub struct HuggingFaceModelDownloader {
     user_agent: String,
     client: Client,
     unnecessary_files: HashSet<PathBuf>,
+    models_dir_ownership: Option<Ownership>,
 }
 
 impl HuggingFaceModelDownloader {
@@ -59,11 +60,15 @@ impl HuggingFaceModelDownloader {
             ))
             .build()?;
 
+        let models_dir_ownership =
+            infer_models_dir_ownership(&settings.ollama_library.models_path)?;
+
         Ok(Self {
             settings,
             user_agent,
             client,
             unnecessary_files: HashSet::new(),
+            models_dir_ownership,
         })
     }
 
@@ -122,7 +127,7 @@ impl HuggingFaceModelDownloader {
             source,
             named_digest,
             computed_digest,
-            self.settings.ollama_library.user_group.as_ref(),
+            self.models_dir_ownership,
             &mut self.unnecessary_files,
         )
     }
@@ -147,9 +152,10 @@ impl HuggingFaceModelDownloader {
 
         save_manifest(
             data,
+            &models_path,
             &manifests_dir,
             tag,
-            self.settings.ollama_library.user_group.as_ref(),
+            self.models_dir_ownership,
             &[&manifests_dir, &manifests_toplevel_dir],
             &mut self.unnecessary_files,
         )
@@ -192,6 +198,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
             user_agent: self.user_agent.clone(),
             client: self.client.clone(),
             unnecessary_files: HashSet::new(),
+            models_dir_ownership: self.models_dir_ownership,
         };
 
         // Fetch and parse manifest

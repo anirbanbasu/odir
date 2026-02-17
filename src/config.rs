@@ -51,9 +51,6 @@ pub struct OllamaLibrary {
 
     /// Timeout for HTTP requests in seconds.
     pub timeout: f64,
-
-    /// Username and group that should own the Ollama models path.
-    pub user_group: Option<(String, String)>,
 }
 
 impl Default for OllamaLibrary {
@@ -64,7 +61,6 @@ impl Default for OllamaLibrary {
             library_base_url: "https://ollama.com/library/".to_string(),
             verify_ssl: true,
             timeout: 120.0,
-            user_group: None,
         }
     }
 }
@@ -284,7 +280,6 @@ mod tests {
         assert_eq!(library.library_base_url, "https://ollama.com/library/");
         assert_eq!(library.verify_ssl, true);
         assert_eq!(library.timeout, 120.0);
-        assert_eq!(library.user_group, None);
     }
 
     #[test]
@@ -317,8 +312,7 @@ mod tests {
                 "registry_base_url": "https://registry.test.com/",
                 "library_base_url": "https://library.test.com/",
                 "verify_ssl": false,
-                "timeout": 60.0,
-                "user_group": null
+                "timeout": 60.0
             }
         }"#;
 

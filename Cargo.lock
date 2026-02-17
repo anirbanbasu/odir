@@ -944,6 +944,7 @@ dependencies = [
  "directories",
  "env_logger",
  "indicatif",
+ "libc",
  "log",
  "regex",
  "reqwest",

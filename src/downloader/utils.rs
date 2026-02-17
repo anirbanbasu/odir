@@ -74,6 +74,53 @@ pub fn expand_models_path(models_path: &str) -> Result<PathBuf> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Ownership {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+pub fn infer_models_dir_ownership(models_path: &str) -> Result<Option<Ownership>> {
+    if !is_running_as_root() {
+        return Ok(None);
+    }
+
+    let models_path = expand_models_path(models_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(&models_path) {
+            Ok(metadata) => Ok(Some(Ownership {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            })),
+            Err(e) => {
+                warn!(
+                    "Failed to infer models directory ownership for {:?}: {}",
+                    models_path, e
+                );
+                Ok(None)
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = models_path;
+        Ok(None)
+    }
+}
+
+fn is_running_as_root() -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::geteuid() == 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 pub fn download_model_blob(
     client: &Client,
     url: &str,
@@ -145,7 +192,7 @@ pub fn save_blob(
     source: &Path,
     named_digest: &str,
     computed_digest: &str,
-    user_group: Option<&(String, String)>,
+    models_dir_ownership: Option<Ownership>,
     unnecessary_files: &mut HashSet<PathBuf>,
 ) -> Result<PathBuf> {
     // Verify digest matches (skip "sha256:" prefix)
@@ -183,9 +230,9 @@ pub fn save_blob(
     let target_file = blobs_dir.join(named_digest.replace(':', "-"));
     fs::copy(source, &target_file)?;
 
-    if let Some((user, group)) = user_group {
-        apply_user_group(&target_file, user, group);
-        apply_user_group(&blobs_dir, user, group);
+    if let Some(ownership) = models_dir_ownership {
+        ensure_ownership(&target_file, ownership);
+        ensure_ownership(&blobs_dir, ownership);
     }
 
     // Remove source from unnecessary files and add target
@@ -199,9 +246,10 @@ pub fn save_blob(
 
 pub fn save_manifest(
     data: &str,
+    models_root: &Path,
     manifests_dir: &Path,
     tag: &str,
-    user_group: Option<&(String, String)>,
+    models_dir_ownership: Option<Ownership>,
     chown_dirs: &[&Path],
     unnecessary_files: &mut HashSet<PathBuf>,
 ) -> Result<PathBuf> {
@@ -217,10 +265,11 @@ pub fn save_manifest(
     let target_file = manifests_dir.join(tag);
     fs::write(&target_file, data)?;
 
-    if let Some((user, group)) = user_group {
-        apply_user_group(&target_file, user, group);
+    if let Some(ownership) = models_dir_ownership {
+        ensure_ownership_for_dir_tree(models_root, manifests_dir, ownership);
+        ensure_ownership(&target_file, ownership);
         for dir in chown_dirs {
-            apply_user_group(dir, user, group);
+            ensure_ownership(dir, ownership);
         }
     }
     info!("Saved manifest to {:?}", target_file);
@@ -255,10 +304,48 @@ pub fn cleanup_unnecessary_files(unnecessary_files: &mut HashSet<PathBuf>) {
     }
 }
 
-pub fn apply_user_group(path: &Path, user: &str, group: &str) {
+fn ensure_ownership(path: &Path, ownership: Ownership) {
     #[cfg(unix)]
     {
-        let spec = format!("{}:{}", user, group);
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                if metadata.uid() != ownership.uid || metadata.gid() != ownership.gid {
+                    apply_ownership(path, ownership);
+                }
+            }
+            Err(e) => warn!("Failed to read ownership for {:?}: {}", path, e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, ownership);
+    }
+}
+
+fn ensure_ownership_for_dir_tree(models_root: &Path, dir: &Path, ownership: Ownership) {
+    if !dir.starts_with(models_root) {
+        return;
+    }
+
+    let mut current = dir;
+    loop {
+        ensure_ownership(current, ownership);
+        if current == models_root {
+            break;
+        }
+
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+}
+
+fn apply_ownership(path: &Path, ownership: Ownership) {
+    #[cfg(unix)]
+    {
+        let spec = format!("{}:{}", ownership.uid, ownership.gid);
         match Command::new("chown").arg(&spec).arg(path).status() {
             Ok(status) if status.success() => {}
             Ok(status) => warn!("Failed to chown {:?}: exit status {}", path, status),
@@ -267,6 +354,6 @@ pub fn apply_user_group(path: &Path, user: &str, group: &str) {
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, user, group);
+        let _ = (path, ownership);
     }
 }
