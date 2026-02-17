@@ -86,44 +86,44 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(subcommand_help_heading = "Configuration")]
-    /// `show-config`: Shows the application configuration as JSON.
+    /// Shows the application configuration as JSON.
     ShowConfig,
 
     #[command(subcommand_help_heading = "Configuration")]
-    /// `edit-config`: Interactively edits application settings through step-by-step questions.
+    /// Interactively edits application settings through step-by-step questions.
     ///
     /// If a settings file already exists, the current values will be shown as defaults.
     /// Otherwise, the default configuration values will be used.
     EditConfig {
-        /// `--config-file`: Optional configuration file path to edit.
+        /// Optional configuration file path to edit.
         /// If not provided, uses the default user settings location.
         #[arg(long, short)]
         config_file: Option<String>,
     },
 
     #[command(subcommand_help_heading = "Ollama Library")]
-    /// `list-models`: Lists all available models in the Ollama library.
+    /// Lists all available models in the Ollama library.
     ///
     /// If pagination options are not provided, all models will be listed.
     ListModels {
-        /// `--page`: The page number to retrieve (1-indexed).
+        /// The page number to retrieve (1-indexed).
         #[arg(long)]
         page: Option<u32>,
 
-        /// `--page-size`: The number of models to retrieve per page.
+        /// The number of models to retrieve per page.
         #[arg(long)]
         page_size: Option<u32>,
     },
 
     #[command(subcommand_help_heading = "Ollama Library")]
-    /// `list-tags`: Lists all tags for a specific model.
+    /// Lists all tags for a specific model.
     ListTags {
         /// The name of the model to list tags for, e.g., llama3.1.
         model_identifier: String,
     },
 
     #[command(subcommand_help_heading = "Ollama Library")]
-    /// `model-download`: Downloads a specific Ollama model with the given tag.
+    /// Downloads a specific Ollama model with the given tag.
     ModelDownload {
         /// The name of the model and a specific tag to download, specified as {model}:{tag},
         /// e.g., llama3.1:8b. If no tag is specified, 'latest' will be assumed.
@@ -131,19 +131,19 @@ enum Commands {
     },
 
     #[command(subcommand_help_heading = "Hugging Face Models")]
-    /// `hf-list-models`: Lists available models from Hugging Face that can be downloaded into Ollama.
+    /// Lists available models from Hugging Face that can be downloaded into Ollama.
     HfListModels {
-        /// `--page`: The page number to retrieve (1-indexed).
+        /// The page number to retrieve (1-indexed).
         #[arg(long, default_value_t = 1)]
         page: u32,
 
-        /// `--page-size`: The number of models to retrieve per page.
+        /// The number of models to retrieve per page.
         #[arg(long, default_value_t = 25)]
         page_size: u32,
     },
 
     #[command(subcommand_help_heading = "Hugging Face Models")]
-    /// `hf-list-tags`: Lists all available quantisations as tags for a Hugging Face model that can be downloaded into Ollama.
+    /// Lists all available quantisations as tags for a Hugging Face model that can be downloaded into Ollama.
     ///
     /// Note that these are NOT the same as Hugging Face model tags.
     HfListTags {
@@ -152,7 +152,7 @@ enum Commands {
     },
 
     #[command(subcommand_help_heading = "Hugging Face Models")]
-    /// `hf-model-download`: Downloads a specified Hugging Face model.
+    /// Downloads a specified Hugging Face model.
     HfModelDownload {
         /// The name of the specific Hugging Face model to download, specified as
         /// {username}/{repository}:{quantisation}, e.g., bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M.
@@ -160,7 +160,7 @@ enum Commands {
     },
 
     #[command(subcommand_help_heading = "Compatibility")]
-    /// `od-copy-settings`: Copies a Ollama Downloader settings file to the ODIR settings location.
+    /// Copies a Ollama Downloader settings file to the ODIR settings location.
     OdCopySettings {
         /// Path to the existing Ollama Downloader settings file.
         od_settings_file: String,

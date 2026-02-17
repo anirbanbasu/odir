@@ -4,6 +4,47 @@ Thank you for your interest in contributing to the Ollama Downloader in Rust (OD
 
 We will, in the future, update this document with more detailed contribution guidelines.
 
+## Just recipes for development
+
+To set up a development environment for ODIR, you can follow these steps.
+
+1. **Clone the Repository:**
+    If you haven't already, clone the ODIR repository to your local machine:
+
+   ```bash
+   git clone https://github.com/anirbanbasu/odir.git
+   ```
+
+2. **Install Rust toolchain:**
+   If you haven't already, install Rust using [the instructions](https://rust-lang.org/tools/install/).
+
+3. **Install necessary tools:**
+    - _just_ is a handy command runner, which you can install using [the instructions](https://github.com/casey/just?tab=readme-ov-file#installation).
+    - _prek_ is a fast Rust-based alternative to `pre-commit`, which you can install using [the instructions](https://prek.j178.dev/installation/).
+    - _osv-scanner_ is a tool for scanning dependencies for vulnerabilities, which you can install using [the instructions](https://google.github.io/osv-scanner/installation/).
+
+4. **Set up pre-commit hooks:**
+   To ensure code quality and consistency, we use `pre-commit` hooks. You can set them up by running:
+
+   ```bash
+   just install-pre-commit-hooks
+   ```
+
+5. **Install tools for development:**
+   Run the `just` recipe to install all necessary tools for development.
+
+   ```bash
+   just install-tools
+   ```
+
+6. **Check available `just` recipes:**
+   You can check the available `just` recipes for various development tasks by running:
+
+   ```bash
+   just -l
+   ```
+
+
 ## Licensing & Contributions
 
 By contributing to this project, you agree to the following:
