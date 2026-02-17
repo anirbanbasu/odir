@@ -57,10 +57,18 @@ type-check-and-lint:
     @echo "Type checking and linting complete."
 
 # Fix with clippy
-clippy-fix:
+type-check-and-lint-fix:
     @echo "Running clippy with automatic fixes..."
     @cargo clippy --fix --allow-dirty --allow-staged
     @echo "Clippy fixes applied."
+
+# Generate crate documentation
+generate-docs-and-show-in-browser:
+    @echo "Cleaning old documentation..."
+    @rm -rf target/doc
+    @echo "Generating crate documentation..."
+    @cargo doc --no-deps --open
+    @echo "Documentation generated and opened in browser."
 
 # Run tests
 test:

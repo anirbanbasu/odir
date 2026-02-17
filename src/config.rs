@@ -1,6 +1,7 @@
 use directories::ProjectDirs;
-use log::{LevelFilter, info};
+use log::{LevelFilter, info, warn};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::io;
@@ -77,6 +78,7 @@ pub struct AppSettings {
 
 impl AppSettings {
     /// Load settings from the configuration file, or create default settings if the file does not exist.
+    /// If the file exists but has validation errors, attempts to repair it with defaults.
     ///
     /// # Arguments
     /// * `settings_file` - Path to the settings file
@@ -108,7 +110,148 @@ impl AppSettings {
     /// * `Result<Self, io::Error>` - The loaded settings or an error
     pub fn load_settings<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
         let content = fs::read_to_string(settings_file)?;
-        serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        match serde_json::from_str(&content) {
+            Ok(settings) => Ok(settings),
+            Err(e) => {
+                // If deserialization fails, try lenient loading with defaults
+                warn!(
+                    "Strict deserialization failed: {}. Attempting to load with defaults...",
+                    e
+                );
+                Self::load_settings_lenient(&content).map_err(|lenient_err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Failed strict deserialization: {}. Failed lenient deserialization: {}",
+                            e, lenient_err
+                        ),
+                    )
+                })
+            }
+        }
+    }
+
+    /// Load settings from JSON content with lenient deserialization.
+    /// Missing fields will be replaced with defaults, and warnings will be issued.
+    ///
+    /// # Arguments
+    /// * `content` - The JSON content as a string
+    ///
+    /// # Returns
+    /// * `Result<Self, String>` - The loaded settings with defaults, or error message
+    fn load_settings_lenient(content: &str) -> Result<Self, String> {
+        let mut parsed: Value =
+            serde_json::from_str(content).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+        // Get or create the ollama_server object
+        let mut ollama_server = parsed
+            .get_mut("ollama_server")
+            .and_then(|v| v.as_object_mut())
+            .map(|obj| obj.clone())
+            .unwrap_or_default();
+
+        // Fill in missing ollama_server fields with defaults
+        let defaults = OllamaServer::default();
+        if !ollama_server.contains_key("url") {
+            warn!(
+                "Missing field 'ollama_server.url', using default: {}",
+                defaults.url
+            );
+            ollama_server.insert("url".to_string(), Value::String(defaults.url));
+        }
+        if !ollama_server.contains_key("api_key") {
+            warn!("Missing field 'ollama_server.api_key', using default: None");
+            ollama_server.insert("api_key".to_string(), Value::Null);
+        }
+        if !ollama_server.contains_key("remove_downloaded_on_error") {
+            warn!(
+                "Missing field 'ollama_server.remove_downloaded_on_error', using default: {}",
+                defaults.remove_downloaded_on_error
+            );
+            ollama_server.insert(
+                "remove_downloaded_on_error".to_string(),
+                Value::Bool(defaults.remove_downloaded_on_error),
+            );
+        }
+        if !ollama_server.contains_key("check_model_presence") {
+            warn!(
+                "Missing field 'ollama_server.check_model_presence', using default: {}",
+                defaults.check_model_presence
+            );
+            ollama_server.insert(
+                "check_model_presence".to_string(),
+                Value::Bool(defaults.check_model_presence),
+            );
+        }
+
+        // Get or create the ollama_library object
+        let mut ollama_library = parsed
+            .get_mut("ollama_library")
+            .and_then(|v| v.as_object_mut())
+            .map(|obj| obj.clone())
+            .unwrap_or_default();
+
+        // Fill in missing ollama_library fields with defaults
+        let defaults = OllamaLibrary::default();
+        if !ollama_library.contains_key("models_path") {
+            warn!(
+                "Missing field 'ollama_library.models_path', using default: {}",
+                defaults.models_path
+            );
+            ollama_library.insert(
+                "models_path".to_string(),
+                Value::String(defaults.models_path),
+            );
+        }
+        if !ollama_library.contains_key("registry_base_url") {
+            warn!(
+                "Missing field 'ollama_library.registry_base_url', using default: {}",
+                defaults.registry_base_url
+            );
+            ollama_library.insert(
+                "registry_base_url".to_string(),
+                Value::String(defaults.registry_base_url),
+            );
+        }
+        if !ollama_library.contains_key("library_base_url") {
+            warn!(
+                "Missing field 'ollama_library.library_base_url', using default: {}",
+                defaults.library_base_url
+            );
+            ollama_library.insert(
+                "library_base_url".to_string(),
+                Value::String(defaults.library_base_url),
+            );
+        }
+        if !ollama_library.contains_key("verify_ssl") {
+            warn!(
+                "Missing field 'ollama_library.verify_ssl', using default: {}",
+                defaults.verify_ssl
+            );
+            ollama_library.insert("verify_ssl".to_string(), Value::Bool(defaults.verify_ssl));
+        }
+        if !ollama_library.contains_key("timeout") {
+            warn!(
+                "Missing field 'ollama_library.timeout', using default: {}",
+                defaults.timeout
+            );
+            ollama_library.insert(
+                "timeout".to_string(),
+                Value::Number(
+                    serde_json::Number::from_f64(defaults.timeout)
+                        .unwrap_or_else(|| serde_json::Number::from(120)),
+                ),
+            );
+        }
+
+        // Reconstruct the settings object with filled-in values
+        let settings_object = json!({
+            "ollama_server": ollama_server,
+            "ollama_library": ollama_library,
+        });
+
+        serde_json::from_value(settings_object)
+            .map_err(|e| format!("Failed to deserialize settings with defaults: {}", e))
     }
 
     /// Save the application settings to the configuration file.
@@ -222,7 +365,7 @@ pub fn get_settings_file_path() -> PathBuf {
 
 /// Get the user agent string for HTTP requests.
 ///
-/// Returns a string in the format "odir/<version>".
+/// Returns a string in the format "odir/{version}".
 ///
 /// # Returns
 /// * `String` - User agent string
@@ -407,6 +550,82 @@ mod tests {
         let result = AppSettings::load_settings(test_file);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_load_settings_with_missing_fields() {
+        let test_file = "target/test_missing_fields.json";
+        let json_with_missing_fields = r#"{
+            "ollama_server": {
+                "url": "http://custom:8080/",
+                "remove_downloaded_on_error": false
+            },
+            "ollama_library": {
+                "models_path": "/custom/models"
+            }
+        }"#;
+        fs::write(test_file, json_with_missing_fields).unwrap();
+
+        // Should successfully load with lenient deserialization
+        let result = AppSettings::load_settings(test_file);
+        assert!(result.is_ok());
+
+        let settings = result.unwrap();
+        // Check that provided values are preserved
+        assert_eq!(settings.ollama_server.url, "http://custom:8080/");
+        assert_eq!(settings.ollama_server.remove_downloaded_on_error, false);
+        assert_eq!(settings.ollama_library.models_path, "/custom/models");
+
+        // Check that missing values use defaults
+        assert_eq!(settings.ollama_server.api_key, None);
+        assert_eq!(settings.ollama_server.check_model_presence, true); // default
+        assert_eq!(
+            settings.ollama_library.registry_base_url,
+            "https://registry.ollama.ai/v2/library/"
+        ); // default
+        assert_eq!(
+            settings.ollama_library.library_base_url,
+            "https://ollama.com/library/"
+        ); // default
+        assert_eq!(settings.ollama_library.verify_ssl, true); // default
+        assert_eq!(settings.ollama_library.timeout, 120.0); // default
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_load_settings_lenient_with_extra_fields() {
+        let test_file = "target/test_extra_fields.json";
+        let json_with_extra_fields = r#"{
+            "ollama_server": {
+                "url": "http://test:9000/",
+                "api_key": "test_key",
+                "remove_downloaded_on_error": true,
+                "check_model_presence": false,
+                "extra_field": "should_be_ignored"
+            },
+            "ollama_library": {
+                "models_path": "/test",
+                "registry_base_url": "https://test",
+                "library_base_url": "https://test.lib",
+                "verify_ssl": false,
+                "timeout": 60.0,
+                "unknown_field": 123
+            }
+        }"#;
+        fs::write(test_file, json_with_extra_fields).unwrap();
+
+        // Should successfully load even with extra unknown fields
+        let result = AppSettings::load_settings(test_file);
+        assert!(result.is_ok());
+
+        let settings = result.unwrap();
+        assert_eq!(settings.ollama_server.url, "http://test:9000/");
+        assert_eq!(settings.ollama_server.api_key, Some("test_key".to_string()));
+        assert_eq!(settings.ollama_server.check_model_presence, false);
+        assert_eq!(settings.ollama_library.timeout, 60.0);
 
         fs::remove_file(test_file).unwrap();
     }

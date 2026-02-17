@@ -19,7 +19,7 @@ const STYLES: Styles = Styles::styled()
     .valid(AnsiColor::Green.on_default())
     .invalid(AnsiColor::Red.on_default());
 
-/// A command-line interface for the Ollama Downloader in Rust (ODIR), which is a Rust port of the Python-based Ollama Downloader (https://github.com/anirbanbasu/ollama-downloader).
+/// A command-line interface for the Ollama Downloader in Rust (ODIR), which is a Rust port of the Python-based [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader).
 #[derive(Parser)]
 #[command(name = "odir")]
 #[command(version, about)]
@@ -73,7 +73,7 @@ enum Commands {
     #[command(subcommand_help_heading = "Ollama Library")]
     /// Downloads a specific Ollama model with the given tag.
     ModelDownload {
-        /// The name of the model and a specific tag to download, specified as <model>:<tag>,
+        /// The name of the model and a specific tag to download, specified as {model}:{tag},
         /// e.g., llama3.1:8b. If no tag is specified, 'latest' will be assumed.
         model_tag: String,
     },
@@ -103,7 +103,7 @@ enum Commands {
     /// Downloads a specified Hugging Face model.
     HfModelDownload {
         /// The name of the specific Hugging Face model to download, specified as
-        /// <username>/<repository>:<quantisation>, e.g., bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M.
+        /// {username}/{repository}:{quantisation}, e.g., bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M.
         user_repo_quant: String,
     },
 
@@ -330,6 +330,13 @@ fn main() {
                         config::get_settings_file_path(),
                         e
                     );
+                    // Provide helpful guidance to the user
+                    if e.kind() == io::ErrorKind::InvalidData {
+                        eprintln!(
+                            "\n⚠ Settings file has validation errors that could not be recovered."
+                        );
+                        eprintln!("  Try running 'odir edit-config' to fix your settings.\n");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -353,6 +360,10 @@ fn main() {
                             "Settings file exists but could not be loaded: {}. Using defaults.",
                             e
                         );
+                        eprintln!(
+                            "\n⚠ Settings file has validation errors but default values have been used."
+                        );
+                        eprintln!("  Error: {}\n", e);
                         None
                     }
                 }

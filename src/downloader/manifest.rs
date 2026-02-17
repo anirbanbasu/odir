@@ -33,7 +33,7 @@ pub struct ImageManifestLayerEntry {
 }
 
 /// Data model representing an Ollama image manifest
-/// Based on: https://distribution.github.io/distribution/spec/manifest-v2-2/#image-manifest
+/// Based on: [Image Manifest specification](https://distribution.github.io/distribution/spec/manifest-v2-2/#image-manifest)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageManifest {
