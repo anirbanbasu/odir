@@ -1,3 +1,4 @@
+//! Downloader implementation for Ollama library models.
 use crate::config::AppSettings;
 use crate::downloader::manifest::ImageManifest;
 use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};

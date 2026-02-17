@@ -1,3 +1,5 @@
+//! Data models for the Ollama Downloader in Rust (ODIR),
+//! including the image manifest structure based on the OCI Image Manifest specification.
 use serde::{Deserialize, Serialize};
 
 /// Configuration section of the image manifest

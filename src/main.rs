@@ -1,3 +1,53 @@
+//! # Ollama Downloader in Rust (ODIR)
+//!
+//! Ollama Downloader in Rust (ODIR), pronounced _oh dear_,
+//! is a command-line tool written in Rust for downloading models from Ollama.
+//! A successor of the original Python implementation called [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader),
+//! ODIR has been rewritten in Rust to leverage its performance and safety features.
+//!
+//! ## Features
+//! - List available models and their tags in the Ollama library.
+//! - Download models from the Ollama library with specific tags.
+//! - List available Hugging Face models and their quantisation tags compatible with Ollama.
+//! - Download compatible models from Hugging Face with specific quantisations.
+//! - Interactive application configuration management with validation and defaults.
+//!
+//! ## Usage
+//! ```bash
+//! # Show current configuration
+//! odir show-config
+//! ```
+//! ```bash
+//! # Edit configuration interactively
+//! odir edit-config
+//! ```
+//! ```bash
+//! # List available models in the Ollama library
+//! odir list-models
+//! ```
+//! ```bash
+//! # List available tags for a specific model in the Ollama library
+//! odir list-tags llama3.1
+//! ```
+//! ```bash
+//! # Download a specific model with tag from the Ollama library
+//! odir model-download llama3.1:8b
+//! ```
+//! ```bash
+//! # List available Hugging Face models compatible with Ollama
+//! odir hf-list-models
+//! ```
+//! ```bash
+//! # List available quantisation tags for a Hugging Face model
+//! odir hf-list-tags bartowski/Llama-3.2-1B-Instruct-GGUF
+//! ```
+//! ```bash
+//! # Download a specific Hugging Face model with quantisation
+//! odir hf-model-download bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M
+//! ```
+//! For more details, see the [GitHub repository](
+//! https://github.com/anirbanbasu/odir) and the `--help` output of the command-line application.
+
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn};
@@ -10,6 +60,7 @@ use config::{AppSettings, Config};
 mod downloader;
 use downloader::{HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader};
 
+#[doc(hidden)]
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .usage(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
@@ -19,7 +70,7 @@ const STYLES: Styles = Styles::styled()
     .valid(AnsiColor::Green.on_default())
     .invalid(AnsiColor::Red.on_default());
 
-/// A command-line interface for the Ollama Downloader in Rust (ODIR), which is a Rust port of the Python-based [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader).
+/// A command-line interface for the Ollama Downloader in Rust (ODIR), which is a Rust port and successor of the Python-based [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader).
 #[derive(Parser)]
 #[command(name = "odir")]
 #[command(version, about)]
@@ -31,47 +82,48 @@ struct Cli {
     command: Commands,
 }
 
+/// The available commands for the Ollama Downloader in Rust (ODIR) command-line application.
 #[derive(Subcommand)]
 enum Commands {
     #[command(subcommand_help_heading = "Configuration")]
-    /// Shows the application configuration as JSON.
+    /// `show-config`: Shows the application configuration as JSON.
     ShowConfig,
 
     #[command(subcommand_help_heading = "Configuration")]
-    /// Interactively edits application settings through step-by-step questions.
+    /// `edit-config`: Interactively edits application settings through step-by-step questions.
     ///
     /// If a settings file already exists, the current values will be shown as defaults.
     /// Otherwise, the default configuration values will be used.
     EditConfig {
-        /// Optional configuration file path to edit.
+        /// `--config-file`: Optional configuration file path to edit.
         /// If not provided, uses the default user settings location.
         #[arg(long, short)]
         config_file: Option<String>,
     },
 
     #[command(subcommand_help_heading = "Ollama Library")]
-    /// Lists all available models in the Ollama library.
+    /// `list-models`: Lists all available models in the Ollama library.
     ///
     /// If pagination options are not provided, all models will be listed.
     ListModels {
-        /// The page number to retrieve (1-indexed).
+        /// `--page`: The page number to retrieve (1-indexed).
         #[arg(long)]
         page: Option<u32>,
 
-        /// The number of models to retrieve per page.
+        /// `--page-size`: The number of models to retrieve per page.
         #[arg(long)]
         page_size: Option<u32>,
     },
 
     #[command(subcommand_help_heading = "Ollama Library")]
-    /// Lists all tags for a specific model.
+    /// `list-tags`: Lists all tags for a specific model.
     ListTags {
         /// The name of the model to list tags for, e.g., llama3.1.
         model_identifier: String,
     },
 
     #[command(subcommand_help_heading = "Ollama Library")]
-    /// Downloads a specific Ollama model with the given tag.
+    /// `model-download`: Downloads a specific Ollama model with the given tag.
     ModelDownload {
         /// The name of the model and a specific tag to download, specified as {model}:{tag},
         /// e.g., llama3.1:8b. If no tag is specified, 'latest' will be assumed.
@@ -79,19 +131,19 @@ enum Commands {
     },
 
     #[command(subcommand_help_heading = "Hugging Face Models")]
-    /// Lists available models from Hugging Face that can be downloaded into Ollama.
+    /// `hf-list-models`: Lists available models from Hugging Face that can be downloaded into Ollama.
     HfListModels {
-        /// The page number to retrieve (1-indexed).
+        /// `--page`: The page number to retrieve (1-indexed).
         #[arg(long, default_value_t = 1)]
         page: u32,
 
-        /// The number of models to retrieve per page.
+        /// `--page-size`: The number of models to retrieve per page.
         #[arg(long, default_value_t = 25)]
         page_size: u32,
     },
 
     #[command(subcommand_help_heading = "Hugging Face Models")]
-    /// Lists all available quantisations as tags for a Hugging Face model that can be downloaded into Ollama.
+    /// `hf-list-tags`: Lists all available quantisations as tags for a Hugging Face model that can be downloaded into Ollama.
     ///
     /// Note that these are NOT the same as Hugging Face model tags.
     HfListTags {
@@ -100,7 +152,7 @@ enum Commands {
     },
 
     #[command(subcommand_help_heading = "Hugging Face Models")]
-    /// Downloads a specified Hugging Face model.
+    /// `hf-model-download`: Downloads a specified Hugging Face model.
     HfModelDownload {
         /// The name of the specific Hugging Face model to download, specified as
         /// {username}/{repository}:{quantisation}, e.g., bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M.
@@ -108,7 +160,7 @@ enum Commands {
     },
 
     #[command(subcommand_help_heading = "Compatibility")]
-    /// Copies a Ollama Downloader settings file to the ODIR settings location.
+    /// `od-copy-settings`: Copies a Ollama Downloader settings file to the ODIR settings location.
     OdCopySettings {
         /// Path to the existing Ollama Downloader settings file.
         od_settings_file: String,
@@ -290,6 +342,7 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
     settings
 }
 
+/// The main entry point for the Ollama Downloader in Rust (ODIR) command-line application.
 fn main() {
     // Initialize configuration from environment variables
     let config = Config::from_env();

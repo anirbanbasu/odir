@@ -1,3 +1,4 @@
+//! Configuration management for the Ollama Downloader in Rust (ODIR).
 use directories::ProjectDirs;
 use log::{LevelFilter, info, warn};
 use serde::{Deserialize, Serialize};

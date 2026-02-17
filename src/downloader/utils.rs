@@ -1,3 +1,6 @@
+//! Utility functions for the Ollama Downloader in Rust (ODIR),
+//! including model presence checks, downloading blobs, saving manifests,
+//! and cleaning up temporary files.
 use crate::downloader::model_downloader::{DownloaderError, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};

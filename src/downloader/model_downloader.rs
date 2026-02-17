@@ -1,3 +1,4 @@
+//! Model downloader trait and error definitions for the Ollama Downloader in Rust (ODIR).
 use std::io;
 use thiserror::Error;
 
