@@ -280,6 +280,11 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
         settings.ollama_server.remove_downloaded_on_error,
     );
 
+    settings.ollama_server.check_model_presence = prompt_bool(
+        "Check model presence in Ollama server after downloading?",
+        settings.ollama_server.check_model_presence,
+    );
+
     // Ollama Library settings
     println!("\n--- Ollama Library Settings ---");
     settings.ollama_library.models_path =

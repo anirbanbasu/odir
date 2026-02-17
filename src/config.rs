@@ -18,6 +18,9 @@ pub struct OllamaServer {
     /// Whether to remove downloaded files if the downloaded model cannot be found
     /// on the Ollama server, or the Ollama server cannot be accessed.
     pub remove_downloaded_on_error: bool,
+
+    /// Whether to check if the model is present in the Ollama server after downloading.
+    pub check_model_presence: bool,
 }
 
 impl Default for OllamaServer {
@@ -26,6 +29,7 @@ impl Default for OllamaServer {
             url: "http://localhost:11434/".to_string(),
             api_key: None,
             remove_downloaded_on_error: true,
+            check_model_presence: true,
         }
     }
 }
@@ -266,6 +270,7 @@ mod tests {
         assert_eq!(server.url, "http://localhost:11434/");
         assert_eq!(server.api_key, None);
         assert_eq!(server.remove_downloaded_on_error, true);
+        assert_eq!(server.check_model_presence, true);
     }
 
     #[test]
@@ -304,7 +309,8 @@ mod tests {
             "ollama_server": {
                 "url": "http://test:8080/",
                 "api_key": null,
-                "remove_downloaded_on_error": true
+                "remove_downloaded_on_error": true,
+                "check_model_presence": false
             },
             "ollama_library": {
                 "models_path": "/test/path",
@@ -318,6 +324,7 @@ mod tests {
 
         let settings: AppSettings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.ollama_server.url, "http://test:8080/");
+        assert_eq!(settings.ollama_server.check_model_presence, false);
         assert_eq!(settings.ollama_library.models_path, "/test/path");
         assert_eq!(settings.ollama_library.verify_ssl, false);
         assert_eq!(settings.ollama_library.timeout, 60.0);

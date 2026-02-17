@@ -12,6 +12,7 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tempfile::NamedTempFile;
 
 /// Check if a model is present in the Ollama server
@@ -27,14 +28,13 @@ use tempfile::NamedTempFile;
 fn is_model_present_in_ollama(
     client: &Client,
     server_url: &str,
-    model: &str,
-    tag: &str,
+    model_names: &[String],
 ) -> Result<bool> {
-    let tags_url = format!("{}api/tags", server_url.trim_end_matches('/'));
+    let tags_url = format!("{}/api/tags", server_url.trim_end_matches('/'));
 
     debug!(
-        "Checking Ollama server for model {}:{} at {}",
-        model, tag, tags_url
+        "Checking Ollama server for model(s) {:?} at {}",
+        model_names, tags_url
     );
 
     let response = client.get(&tags_url).send()?;
@@ -52,13 +52,13 @@ fn is_model_present_in_ollama(
     if let Some(models) = tags_response.get("models").and_then(|m| m.as_array()) {
         for model_obj in models {
             if let Some(name) = model_obj.get("name").and_then(|n| n.as_str())
-                && name == format!("{}:{}", model, tag)
+                && model_names.iter().any(|target| name == target)
             {
-                debug!("Model {}:{} found in Ollama server", model, tag);
+                debug!("Model {} found in Ollama server", name);
                 return Ok(true);
             }
         }
-        debug!("Model {}:{} not found in Ollama server", model, tag);
+        debug!("Model(s) {:?} not found in Ollama server", model_names);
         return Ok(false);
     }
 
@@ -66,6 +66,22 @@ fn is_model_present_in_ollama(
     Err(DownloaderError::Other(
         "Failed to parse Ollama tags response".to_string(),
     ))
+}
+
+fn apply_user_group(path: &Path, user: &str, group: &str) {
+    #[cfg(unix)]
+    {
+        let spec = format!("{}:{}", user, group);
+        match Command::new("chown").arg(&spec).arg(path).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => warn!("Failed to chown {:?}: exit status {}", path, status),
+            Err(e) => warn!("Failed to chown {:?}: {}", path, e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, user, group);
+    }
 }
 
 const HF_BASE_URL: &str = "https://hf.co/v2/";
@@ -274,6 +290,11 @@ impl HuggingFaceModelDownloader {
         let target_file = blobs_dir.join(named_digest.replace(':', "-"));
         fs::copy(source, &target_file)?;
 
+        if let Some((ref user, ref group)) = self.settings.ollama_library.user_group {
+            apply_user_group(&target_file, user, group);
+            apply_user_group(&blobs_dir, user, group);
+        }
+
         // Remove source from unnecessary files and add target
         self.unnecessary_files.remove(&source.to_path_buf());
         self.unnecessary_files.insert(target_file.clone());
@@ -325,6 +346,12 @@ impl HuggingFaceModelDownloader {
 
         let target_file = manifests_dir.join(tag);
         fs::write(&target_file, data)?;
+
+        if let Some((ref user, ref group)) = self.settings.ollama_library.user_group {
+            apply_user_group(&target_file, user, group);
+            apply_user_group(&manifests_dir, user, group);
+            apply_user_group(&manifests_toplevel_dir, user, group);
+        }
         info!("Saved manifest to {:?}", target_file);
 
         self.unnecessary_files.insert(target_file.clone());
@@ -453,6 +480,55 @@ impl ModelDownloader for HuggingFaceModelDownloader {
             }
         }
 
+        // Verify the model is present in the Ollama server if configured
+        if self.settings.ollama_server.check_model_presence {
+            let hf_host = HF_BASE_URL
+                .split("//")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .unwrap_or("hf.co");
+            let model_name = format!("{}/{}", hf_host, model_identifier);
+            let model_names = vec![
+                model_name.clone(),
+                format!("huggingface.co/{}", model_identifier),
+                model_identifier.to_string(),
+            ];
+
+            info!("Verifying model {} is present in Ollama server", model_name);
+            let model_present = match is_model_present_in_ollama(
+                &self_mut.client,
+                &self.settings.ollama_server.url,
+                &model_names,
+            ) {
+                Ok(present) => present,
+                Err(e) => {
+                    error!("Failed to verify model with Ollama server: {}", e);
+                    if self.settings.ollama_server.remove_downloaded_on_error {
+                        info!("Removing downloaded files due to verification failure");
+                        self_mut.cleanup_unnecessary_files();
+                    }
+                    return Err(e);
+                }
+            };
+
+            if !model_present {
+                let err_msg = format!(
+                    "Model {} not found in Ollama server after download",
+                    model_name
+                );
+                error!("{}", err_msg);
+                if self.settings.ollama_server.remove_downloaded_on_error {
+                    info!("Removing downloaded files because model not found in Ollama server");
+                    self_mut.cleanup_unnecessary_files();
+                }
+                return Err(DownloaderError::Other(err_msg));
+            }
+
+            info!("Model {} verified in Ollama server", model_name);
+        } else {
+            debug!("Model presence check is disabled via settings");
+        }
+
         // Clear unnecessary files list on success
         self_mut.unnecessary_files.clear();
 
@@ -461,62 +537,6 @@ impl ModelDownloader for HuggingFaceModelDownloader {
             model_identifier
         );
 
-        // Extract model name and tag for verification
-        // HuggingFace models are in format user/repo:tag
-        // We need to convert to just repo:tag format for Ollama
-        let tag = if model_identifier.contains(':') {
-            model_identifier.split(':').next_back().unwrap_or("latest")
-        } else {
-            "latest"
-        };
-
-        // Extract repo name from user/repo format
-        let repo_name = if model_identifier.contains('/') {
-            model_identifier
-                .split('/')
-                .next_back()
-                .unwrap_or(model_identifier)
-        } else {
-            model_identifier
-        };
-
-        // Verify the model is present in the Ollama server
-        // The model name in Ollama will be just the repo name (user/repo becomes repo)
-        info!(
-            "Verifying model {}:{} is present in Ollama server",
-            repo_name, tag
-        );
-        let model_present = match is_model_present_in_ollama(
-            &self_mut.client,
-            &self.settings.ollama_server.url,
-            repo_name,
-            tag,
-        ) {
-            Ok(present) => present,
-            Err(e) => {
-                error!("Failed to verify model with Ollama server: {}", e);
-                if self.settings.ollama_server.remove_downloaded_on_error {
-                    info!("Removing downloaded files due to verification failure");
-                    self_mut.cleanup_unnecessary_files();
-                }
-                return Err(e);
-            }
-        };
-
-        if !model_present {
-            let err_msg = format!(
-                "Model {}:{} not found in Ollama server after download",
-                repo_name, tag
-            );
-            error!("{}", err_msg);
-            if self.settings.ollama_server.remove_downloaded_on_error {
-                info!("Removing downloaded files because model not found in Ollama server");
-                self_mut.cleanup_unnecessary_files();
-            }
-            return Err(DownloaderError::Other(err_msg));
-        }
-
-        info!("Model {}:{} verified in Ollama server", repo_name, tag);
         Ok(true)
     }
 
