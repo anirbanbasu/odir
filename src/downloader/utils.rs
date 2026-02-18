@@ -113,6 +113,42 @@ pub fn infer_models_dir_ownership(models_path: &str) -> Result<Option<Ownership>
     }
 }
 
+pub fn warn_if_models_path_requires_root(models_path: &str, is_download: bool) {
+    if is_running_as_root() || !is_download {
+        return;
+    }
+
+    let models_path = match expand_models_path(models_path) {
+        Ok(path) => path,
+        Err(e) => {
+            warn!("Failed to expand models path {:?}: {}", models_path, e);
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current_uid = unsafe { libc::geteuid() } as u32;
+        match fs::metadata(&models_path) {
+            Ok(metadata) => {
+                if metadata.uid() != current_uid {
+                    warn!(
+                        "Models path {:?} is not owned by the current user. Run this command with superuser rights.",
+                        models_path
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot verify ownership of models path {:?}: {}. Run this command with superuser rights.",
+                    models_path, e
+                );
+            }
+        }
+    }
+}
+
 fn is_running_as_root() -> bool {
     #[cfg(unix)]
     unsafe {
@@ -130,6 +166,20 @@ pub fn download_model_blob(
     named_digest: &str,
     unnecessary_files: &mut HashSet<PathBuf>,
 ) -> Result<(PathBuf, String)> {
+    // Check for interruption before starting download
+    if crate::signal_handler::is_interrupted() {
+        warn!("Download interrupted by user");
+        return Err(DownloaderError::Other(
+            "Download interrupted by user".to_string(),
+        ));
+    }
+    if crate::signal_handler::confirm_pending_interrupt() {
+        warn!("Download interrupted by user");
+        return Err(DownloaderError::Other(
+            "Download interrupted by user".to_string(),
+        ));
+    }
+
     let mut hasher = Sha256::new();
     let mut temp_file = NamedTempFile::new().map_err(DownloaderError::IoError)?;
 
@@ -153,17 +203,43 @@ pub fn download_model_blob(
             .unwrap()
             .progress_chars("#>-"),
     );
-    pb.set_message(format!(
-        "Downloading BLOB {}...{}",
-        &named_digest[..11.min(named_digest.len())],
-        &named_digest[named_digest.len().saturating_sub(4)..]
-    ));
+    pb.set_message(format!("Downloading BLOB {}", &named_digest));
+
+    struct ProgressGuard;
+    impl Drop for ProgressGuard {
+        fn drop(&mut self) {
+            crate::signal_handler::set_progress_active(false);
+        }
+    }
+
+    crate::signal_handler::set_progress_active(true);
+    let _progress_guard = ProgressGuard;
 
     // Stream chunks from the response
     let mut response_reader = response;
     let mut buffer = [0u8; 8192];
 
     loop {
+        // Check for interruption signal during download
+        if crate::signal_handler::is_interrupted() {
+            warn!("Download interrupted by user while downloading BLOB");
+            pb.abandon();
+            return Err(DownloaderError::Other(
+                "Download interrupted by user".to_string(),
+            ));
+        }
+
+        if crate::signal_handler::interrupt_requested() {
+            let should_exit = pb.suspend(crate::signal_handler::confirm_pending_interrupt);
+            if should_exit {
+                warn!("Download interrupted by user while downloading BLOB");
+                pb.abandon();
+                return Err(DownloaderError::Other(
+                    "Download interrupted by user".to_string(),
+                ));
+            }
+        }
+
         let bytes_read = response_reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;

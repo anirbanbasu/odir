@@ -5,6 +5,7 @@ use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Resu
 use crate::downloader::utils::{
     Ownership, cleanup_unnecessary_files, download_model_blob, expand_models_path,
     infer_models_dir_ownership, is_model_present_in_ollama, save_blob, save_manifest,
+    warn_if_models_path_requires_root,
 };
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
@@ -158,6 +159,9 @@ impl OllamaModelDownloader {
 
 impl ModelDownloader for OllamaModelDownloader {
     fn download_model(&self, model_identifier: &str) -> Result<bool> {
+        // Warn about ownership issues before attempting download
+        warn_if_models_path_requires_root(&self.settings.ollama_library.models_path, true);
+
         let (model, tag) = if model_identifier.contains(':') {
             let parts: Vec<&str> = model_identifier.split(':').collect();
             (parts[0].to_string(), parts[1].to_string())
@@ -177,7 +181,14 @@ impl ModelDownloader for OllamaModelDownloader {
         };
 
         // Fetch and parse manifest
-        let manifest_json = self_mut.fetch_manifest(&model, &tag)?;
+        let manifest_json = match self_mut.fetch_manifest(&model, &tag) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to fetch manifest for {}:{}: {}", model, tag, e);
+                self_mut.cleanup_unnecessary_files();
+                return Err(e);
+            }
+        };
         info!("Validating manifest for {}:{}", model, tag);
 
         let manifest: ImageManifest = serde_json::from_str(&manifest_json)
@@ -189,7 +200,14 @@ impl ModelDownloader for OllamaModelDownloader {
         // Download model configuration BLOB
         info!("Downloading model configuration {}", manifest.config.digest);
         let (file_model_config, digest_model_config) =
-            self_mut.download_model_blob(&model, &manifest.config.digest)?;
+            match self_mut.download_model_blob(&model, &manifest.config.digest) {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Failed to download model configuration: {}", e);
+                    self_mut.cleanup_unnecessary_files();
+                    return Err(e);
+                }
+            };
         files_to_be_copied.push((
             file_model_config,
             manifest.config.digest.clone(),
@@ -203,9 +221,33 @@ impl ModelDownloader for OllamaModelDownloader {
                     "Layer: {}, Size: {} bytes, Digest: {}",
                     layer.media_type, layer.size, layer.digest
                 );
+
+                // Check for interruption between layer downloads
+                if crate::signal_handler::is_interrupted() {
+                    warn!("Download interrupted during layer download");
+                    self_mut.cleanup_unnecessary_files();
+                    return Err(DownloaderError::Other(
+                        "Download interrupted by user".to_string(),
+                    ));
+                }
+                if crate::signal_handler::confirm_pending_interrupt() {
+                    warn!("Download interrupted during layer download");
+                    self_mut.cleanup_unnecessary_files();
+                    return Err(DownloaderError::Other(
+                        "Download interrupted by user".to_string(),
+                    ));
+                }
+
                 info!("Downloading {} layer {}", layer.media_type, layer.digest);
                 let (file_layer, digest_layer) =
-                    self_mut.download_model_blob(&model, &layer.digest)?;
+                    match self_mut.download_model_blob(&model, &layer.digest) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            error!("Failed to download layer {}: {}", layer.digest, e);
+                            self_mut.cleanup_unnecessary_files();
+                            return Err(e);
+                        }
+                    };
                 files_to_be_copied.push((file_layer, layer.digest.clone(), digest_layer));
             }
         }
