@@ -535,9 +535,11 @@ fn main() {
                     Ok(downloader) => match downloader.download_model(&model_tag) {
                         Ok(_) => {
                             println!("Model {} download completed successfully", model_tag);
+                            signal_handler::set_cleanup_done();
                         }
                         Err(e) => {
                             error!("Error downloading model '{}': {}", model_tag, e);
+                            signal_handler::set_cleanup_done();
                             std::process::exit(1);
                         }
                     },
@@ -617,12 +619,14 @@ fn main() {
                                 "HuggingFace model {} download completed successfully",
                                 user_repo_quant
                             );
+                            signal_handler::set_cleanup_done();
                         }
                         Err(e) => {
                             error!(
                                 "Error downloading HuggingFace model '{}': {}",
                                 user_repo_quant, e
                             );
+                            signal_handler::set_cleanup_done();
                             std::process::exit(1);
                         }
                     },

@@ -5,6 +5,7 @@ use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Resu
 use crate::downloader::utils::{
     Ownership, cleanup_unnecessary_files, download_model_blob, expand_models_path,
     infer_models_dir_ownership, is_model_present_in_ollama, save_blob, save_manifest,
+    warn_if_models_path_requires_root,
 };
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
@@ -158,6 +159,9 @@ impl OllamaModelDownloader {
 
 impl ModelDownloader for OllamaModelDownloader {
     fn download_model(&self, model_identifier: &str) -> Result<bool> {
+        // Warn about ownership issues before attempting download
+        warn_if_models_path_requires_root(&self.settings.ollama_library.models_path, true);
+
         let (model, tag) = if model_identifier.contains(':') {
             let parts: Vec<&str> = model_identifier.split(':').collect();
             (parts[0].to_string(), parts[1].to_string())
@@ -219,9 +223,14 @@ impl ModelDownloader for OllamaModelDownloader {
                 );
 
                 // Check for interruption between layer downloads
-                if crate::signal_handler::is_interrupted()
-                    || crate::signal_handler::confirm_pending_interrupt()
-                {
+                if crate::signal_handler::is_interrupted() {
+                    warn!("Download interrupted during layer download");
+                    self_mut.cleanup_unnecessary_files();
+                    return Err(DownloaderError::Other(
+                        "Download interrupted by user".to_string(),
+                    ));
+                }
+                if crate::signal_handler::confirm_pending_interrupt() {
                     warn!("Download interrupted during layer download");
                     self_mut.cleanup_unnecessary_files();
                     return Err(DownloaderError::Other(

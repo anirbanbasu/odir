@@ -113,6 +113,44 @@ pub fn infer_models_dir_ownership(models_path: &str) -> Result<Option<Ownership>
     }
 }
 
+pub fn warn_if_models_path_requires_root(models_path: &str, is_download: bool) {
+    if is_running_as_root() || !is_download {
+        return;
+    }
+
+    let models_path = match expand_models_path(models_path) {
+        Ok(path) => path,
+        Err(e) => {
+            warn!("Failed to expand models path {:?}: {}", models_path, e);
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current_uid = unsafe { libc::geteuid() } as u32;
+        match fs::metadata(&models_path) {
+            Ok(metadata) => {
+                if metadata.uid() != current_uid {
+                    warn!(
+                        "Models path {:?} is owned by uid {} (current uid: {}). Run this command with superuser rights.",
+                        models_path,
+                        metadata.uid(),
+                        current_uid
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot verify ownership of models path {:?}: {}. Run this command with superuser rights to download models.",
+                    models_path, e
+                );
+            }
+        }
+    }
+}
+
 fn is_running_as_root() -> bool {
     #[cfg(unix)]
     unsafe {
@@ -131,8 +169,13 @@ pub fn download_model_blob(
     unnecessary_files: &mut HashSet<PathBuf>,
 ) -> Result<(PathBuf, String)> {
     // Check for interruption before starting download
-    if crate::signal_handler::is_interrupted() || crate::signal_handler::confirm_pending_interrupt()
-    {
+    if crate::signal_handler::is_interrupted() {
+        warn!("Download interrupted by user");
+        return Err(DownloaderError::Other(
+            "Download interrupted by user".to_string(),
+        ));
+    }
+    if crate::signal_handler::confirm_pending_interrupt() {
         warn!("Download interrupted by user");
         return Err(DownloaderError::Other(
             "Download interrupted by user".to_string(),
@@ -180,9 +223,17 @@ pub fn download_model_blob(
 
     loop {
         // Check for interruption signal during download
+        if crate::signal_handler::is_interrupted() {
+            warn!("Download interrupted by user while downloading BLOB");
+            pb.abandon();
+            return Err(DownloaderError::Other(
+                "Download interrupted by user".to_string(),
+            ));
+        }
+
         if crate::signal_handler::interrupt_requested() {
             let should_exit = pb.suspend(crate::signal_handler::confirm_pending_interrupt);
-            if should_exit || crate::signal_handler::is_interrupted() {
+            if should_exit {
                 warn!("Download interrupted by user while downloading BLOB");
                 pb.abandon();
                 return Err(DownloaderError::Other(
