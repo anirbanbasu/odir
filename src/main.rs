@@ -539,8 +539,10 @@ fn main() {
                         }
                         Err(e) => {
                             error!("Error downloading model '{}': {}", model_tag, e);
+                            if !signal_handler::is_interrupted() {
+                                std::process::exit(1);
+                            }
                             signal_handler::set_cleanup_done();
-                            std::process::exit(1);
                         }
                     },
                     Err(e) => {
@@ -626,8 +628,10 @@ fn main() {
                                 "Error downloading HuggingFace model '{}': {}",
                                 user_repo_quant, e
                             );
+                            if !signal_handler::is_interrupted() {
+                                std::process::exit(1);
+                            }
                             signal_handler::set_cleanup_done();
-                            std::process::exit(1);
                         }
                     },
                     Err(e) => {

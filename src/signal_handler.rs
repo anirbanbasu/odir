@@ -82,7 +82,7 @@ pub fn confirm_pending_interrupt() -> bool {
 /// Returns true if user confirms (Yes/Y), false if user cancels (No/N)
 fn prompt_for_interrupt_confirmation(signal_name: &str) -> bool {
     eprint!(
-        "\n{}: All partially downloaded temporarily files will be removed. Do you really want to exit? [y/N] (timeout to N in 10 seconds): ",
+        "\n{}: All partially downloaded temporary files will be removed. Do you really want to exit? [y/N] (timeout to N in 10 seconds): ",
         signal_name
     );
     let _ = io::stderr().flush();
@@ -125,13 +125,28 @@ fn prompt_for_interrupt_confirmation(signal_name: &str) -> bool {
     #[cfg(not(unix))]
     {
         if event::poll(Duration::from_secs(10)).unwrap_or(false) {
-            if let Ok(event::Event::Key(key_event)) = event::read() {
-                if let event::KeyCode::Char(c) = key_event.code {
-                    let response = c.to_lowercase().to_string();
-                    return matches!(response.as_str(), "y");
+            let mut input = String::new();
+            loop {
+                match event::read() {
+                    Ok(event::Event::Key(key_event)) => match key_event.code {
+                        event::KeyCode::Char(c) => {
+                            input.push(c);
+                        }
+                        event::KeyCode::Enter => {
+                            let response = input.trim().to_lowercase();
+                            return matches!(response.as_str(), "y" | "yes");
+                        }
+                        event::KeyCode::Esc => {
+                            return false;
+                        }
+                        _ => {}
+                    },
+                    Err(_) => {
+                        error!("Failed to read user input for interrupt confirmation");
+                        return false;
+                    }
                 }
             }
-            false
         } else {
             info!("Interrupt confirmation timed out; continuing");
             false

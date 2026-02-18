@@ -134,16 +134,14 @@ pub fn warn_if_models_path_requires_root(models_path: &str, is_download: bool) {
             Ok(metadata) => {
                 if metadata.uid() != current_uid {
                     warn!(
-                        "Models path {:?} is owned by uid {} (current uid: {}). Run this command with superuser rights.",
-                        models_path,
-                        metadata.uid(),
-                        current_uid
+                        "Models path {:?} is not owned by the current user. Run this command with superuser rights.",
+                        models_path
                     );
                 }
             }
             Err(e) => {
                 warn!(
-                    "Cannot verify ownership of models path {:?}: {}. Run this command with superuser rights to download models.",
+                    "Cannot verify ownership of models path {:?}: {}. Run this command with superuser rights.",
                     models_path, e
                 );
             }

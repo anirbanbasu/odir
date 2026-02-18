@@ -256,6 +256,13 @@ impl ModelDownloader for HuggingFaceModelDownloader {
                         "Download interrupted by user".to_string(),
                     ));
                 }
+                if crate::signal_handler::confirm_pending_interrupt() {
+                    warn!("Download interrupted during layer download");
+                    self_mut.cleanup_unnecessary_files();
+                    return Err(DownloaderError::Other(
+                        "Download interrupted by user".to_string(),
+                    ));
+                }
 
                 info!("Downloading {} layer {}", layer.media_type, layer.digest);
                 let (file_layer, digest_layer) =
