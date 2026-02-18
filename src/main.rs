@@ -1,52 +1,7 @@
-//! # Ollama Downloader in Rust (ODIR)
-//!
-//! Ollama Downloader in Rust (ODIR), pronounced _oh dear_,
-//! is a command-line tool written in Rust for downloading models from Ollama.
-//! A successor of the original Python implementation called [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader),
-//! ODIR has been rewritten in Rust to leverage its performance and safety features.
-//!
-//! ## Features
-//! - List available models and their tags in the Ollama library.
-//! - Download models from the Ollama library with specific tags.
-//! - List available Hugging Face models and their quantisation tags compatible with Ollama.
-//! - Download compatible models from Hugging Face with specific quantisations.
-//! - Interactive application configuration management with validation and defaults.
-//!
-//! ## Usage
-//! ```bash
-//! # Show current configuration
-//! odir show-config
-//! ```
-//! ```bash
-//! # Edit configuration interactively
-//! odir edit-config
-//! ```
-//! ```bash
-//! # List available models in the Ollama library
-//! odir list-models
-//! ```
-//! ```bash
-//! # List available tags for a specific model in the Ollama library
-//! odir list-tags llama3.1
-//! ```
-//! ```bash
-//! # Download a specific model with tag from the Ollama library
-//! odir model-download llama3.1:8b
-//! ```
-//! ```bash
-//! # List available Hugging Face models compatible with Ollama
-//! odir hf-list-models
-//! ```
-//! ```bash
-//! # List available quantisation tags for a Hugging Face model
-//! odir hf-list-tags bartowski/Llama-3.2-1B-Instruct-GGUF
-//! ```
-//! ```bash
-//! # Download a specific Hugging Face model with quantisation
-//! odir hf-model-download bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M
-//! ```
-//! For more details, see the [GitHub repository](
-//! https://github.com/anirbanbasu/odir) and the `--help` output of the command-line application.
+#![doc = include_str!("../README.md")]
+//! ## Source code
+//! The source code is available in the [GitHub repository](
+//! https://github.com/anirbanbasu/odir).
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
