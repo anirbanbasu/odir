@@ -60,6 +60,8 @@ use config::{AppSettings, Config};
 mod downloader;
 use downloader::{HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader};
 
+mod signal_handler;
+
 #[doc(hidden)]
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -359,7 +361,21 @@ fn main() {
         config::get_settings_file_path()
     );
 
+    // Install signal handlers for graceful shutdown
+    signal_handler::install_signal_handlers();
+
     let cli = Cli::parse();
+
+    let requires_interrupt_confirmation = matches!(
+        &cli.command,
+        Commands::ListModels { .. }
+            | Commands::ListTags { .. }
+            | Commands::ModelDownload { .. }
+            | Commands::HfListModels { .. }
+            | Commands::HfListTags { .. }
+            | Commands::HfModelDownload { .. }
+    );
+    signal_handler::set_confirmation_required(requires_interrupt_confirmation);
 
     match cli.command {
         Commands::ShowConfig => {

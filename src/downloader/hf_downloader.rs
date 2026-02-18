@@ -203,7 +203,14 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         };
 
         // Fetch and parse manifest
-        let manifest_json = self_mut.fetch_manifest(model_identifier)?;
+        let manifest_json = match self_mut.fetch_manifest(model_identifier) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to fetch manifest for {}: {}", model_identifier, e);
+                self_mut.cleanup_unnecessary_files();
+                return Err(e);
+            }
+        };
         info!("Validating manifest for {}", model_identifier);
 
         let manifest: ImageManifest = serde_json::from_str(&manifest_json)
@@ -215,7 +222,14 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         // Download model configuration BLOB
         info!("Downloading model configuration {}", manifest.config.digest);
         let (file_model_config, digest_model_config) =
-            self_mut.download_model_blob(&model_repo, &manifest.config.digest)?;
+            match self_mut.download_model_blob(&model_repo, &manifest.config.digest) {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Failed to download model configuration: {}", e);
+                    self_mut.cleanup_unnecessary_files();
+                    return Err(e);
+                }
+            };
         files_to_be_copied.push((
             file_model_config,
             manifest.config.digest.clone(),
@@ -229,9 +243,28 @@ impl ModelDownloader for HuggingFaceModelDownloader {
                     "Layer: {}, Size: {} bytes, Digest: {}",
                     layer.media_type, layer.size, layer.digest
                 );
+
+                // Check for interruption between layer downloads
+                if crate::signal_handler::is_interrupted()
+                    || crate::signal_handler::confirm_pending_interrupt()
+                {
+                    warn!("Download interrupted during layer download");
+                    self_mut.cleanup_unnecessary_files();
+                    return Err(DownloaderError::Other(
+                        "Download interrupted by user".to_string(),
+                    ));
+                }
+
                 info!("Downloading {} layer {}", layer.media_type, layer.digest);
                 let (file_layer, digest_layer) =
-                    self_mut.download_model_blob(&model_repo, &layer.digest)?;
+                    match self_mut.download_model_blob(&model_repo, &layer.digest) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            error!("Failed to download layer {}: {}", layer.digest, e);
+                            self_mut.cleanup_unnecessary_files();
+                            return Err(e);
+                        }
+                    };
                 files_to_be_copied.push((file_layer, layer.digest.clone(), digest_layer));
             }
         }
