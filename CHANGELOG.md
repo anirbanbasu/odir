@@ -52,4 +52,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 
 [unreleased]: https://github.com/anirbanbasu/odir/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/anirbanbasu/odir/releases/tag/v0.0.1...v0.1.0
+[0.1.0]: https://github.com/anirbanbasu/odir/compare/v0.0.1...v0.1.0
