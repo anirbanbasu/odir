@@ -3,6 +3,7 @@ name = "odir"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Ollama Downloader in Rust (ODIR), pronounced _oh dear_, is a command-line tool written in Rust for downloading models from Ollama."
 repository = "https://github.com/anirbanbasu/odir"
 
 [dependencies]
