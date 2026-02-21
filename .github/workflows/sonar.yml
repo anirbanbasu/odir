@@ -1,0 +1,25 @@
+name: SonarQube Scan
+permissions:
+    contents: read
+on:
+    push:
+        branches:
+            - master
+    pull_request:
+        types: [opened, synchronize, reopened]
+jobs:
+    sonarqube:
+        name: SonarQube
+        runs-on: ubuntu-latest
+        steps:
+            - name: Harden the runner (Audit all outbound calls)
+              uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+              with:
+                  egress-policy: audit
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+            - name: SonarQube Scan
+              uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9 # v7.0.0
+              env:
+                  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
