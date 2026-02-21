@@ -76,11 +76,11 @@ test:
     @cargo test
     @echo "Tests complete."
 
-# Generate test coverage report
-coverage:
-    @echo "Generating test coverage report..."
-    @cargo llvm-cov --html
-    @echo "Coverage report generated. Open target/llvm-cov/html/index.html to view."
+# Generate test coverage report and show in browser
+coverage-and-show-in-browser:
+    @echo "Generating test coverage report and opening it in browser..."
+    @cargo llvm-cov --html --open
+    @echo "Coverage report generated and opened in browser."
 
 # Count lines of code and documentation
 count-lines:
