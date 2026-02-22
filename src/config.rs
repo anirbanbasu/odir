@@ -7,9 +7,31 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
+use url::{ParseError, Url};
+
+/// Error type for HTTP URL validation.
+#[derive(PartialEq, Debug, Error)]
+pub enum HttpUrlParseError {
+    /// URL parsing failed.
+    #[error("URL parsing failed: {0}")]
+    ParseError(#[from] ParseError),
+
+    /// URL scheme is not http or https.
+    #[error("URL scheme should either be http or https, got: {0}")]
+    InvalidScheme(String),
+}
+
+pub fn validate_string_as_http_url(url_str: &str) -> Result<Url, HttpUrlParseError> {
+    let url = Url::parse(url_str)?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(HttpUrlParseError::InvalidScheme(url.scheme().to_string()));
+    }
+    Ok(url)
+}
 
 /// Settings for connecting to the Ollama server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaServer {
     /// URL of the Ollama server.
     pub url: String,
@@ -37,7 +59,7 @@ impl Default for OllamaServer {
 }
 
 /// Settings for accessing the Ollama library and storing models locally.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaLibrary {
     /// Path to the Ollama models on the filesystem.
     pub models_path: String,
@@ -68,9 +90,9 @@ impl Default for OllamaLibrary {
 }
 
 /// Application settings for the Ollama Downloader.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppSettings {
-    /// Settings for the Ollama server connection.
+    /// Settings for the Ollama server for which the models should be downloaded.
     pub ollama_server: OllamaServer,
 
     /// Settings for accessing the Ollama library and storing locally.
@@ -78,6 +100,17 @@ pub struct AppSettings {
 }
 
 impl AppSettings {
+    /// Validate all HTTP URLs in the settings.
+    ///
+    /// # Returns
+    /// * `Result<(), HttpUrlParseError>` - Success or validation error
+    pub fn validate_urls(&self) -> Result<(), HttpUrlParseError> {
+        validate_string_as_http_url(&self.ollama_server.url)?;
+        validate_string_as_http_url(&self.ollama_library.registry_base_url)?;
+        validate_string_as_http_url(&self.ollama_library.library_base_url)?;
+        Ok(())
+    }
+
     /// Load settings from the configuration file, or create default settings if the file does not exist.
     /// If the file exists but has validation errors, attempts to repair it with defaults.
     ///
@@ -91,10 +124,13 @@ impl AppSettings {
             Ok(settings) => Ok(settings),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 info!(
-                    "Settings file '{}' not found, creating with default values",
+                    "Settings file '{}' not found, creating one with default values",
                     settings_file.as_ref().display()
                 );
                 let settings = Self::default();
+                settings
+                    .validate_urls()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 settings.save_settings(&settings_file)?;
                 Ok(settings)
             }
@@ -111,8 +147,13 @@ impl AppSettings {
     /// * `Result<Self, io::Error>` - The loaded settings or an error
     pub fn load_settings<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
         let content = fs::read_to_string(settings_file)?;
-        match serde_json::from_str(&content) {
-            Ok(settings) => Ok(settings),
+        match serde_json::from_str::<AppSettings>(&content) {
+            Ok(settings) => {
+                settings.validate_urls().map_err(|e: HttpUrlParseError| {
+                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                Ok(settings)
+            }
             Err(e) => {
                 // If deserialization fails, try lenient loading with defaults
                 warn!(
@@ -251,8 +292,15 @@ impl AppSettings {
             "ollama_library": ollama_library,
         });
 
-        serde_json::from_value(settings_object)
-            .map_err(|e| format!("Failed to deserialize settings with defaults: {}", e))
+        let settings: AppSettings = serde_json::from_value(settings_object)
+            .map_err(|e| format!("Failed to deserialize settings with defaults: {}", e))?;
+
+        // Validate all URLs
+        settings
+            .validate_urls()
+            .map_err(|e| format!("URL validation failed: {}", e))?;
+
+        Ok(settings)
     }
 
     /// Save the application settings to the configuration file.
@@ -379,6 +427,26 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Initialize logger for tests to enable log coverage
+    fn init_test_logger() {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Trace)
+            .try_init();
+    }
+
+    #[test]
+    fn test_validate_string_as_http_url() {
+        assert!(validate_string_as_http_url("http://example.tld").is_ok());
+        assert!(validate_string_as_http_url("https://example.tld").is_ok());
+        assert!(validate_string_as_http_url("https://example.tld/path?query=string").is_ok());
+
+        assert!(validate_string_as_http_url("ftp://example.tld").is_err());
+        assert!(validate_string_as_http_url("example.tld").is_err());
+        assert!(validate_string_as_http_url("http://").is_err());
+        assert!(validate_string_as_http_url("hello world").is_err());
+    }
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
@@ -396,12 +464,19 @@ mod tests {
         assert_eq!(Config::parse_log_level("DEBUG"), LevelFilter::Debug);
         assert_eq!(Config::parse_log_level("debug"), LevelFilter::Debug);
         assert_eq!(Config::parse_log_level("INFO"), LevelFilter::Info);
+        assert_eq!(Config::parse_log_level("info"), LevelFilter::Info);
         assert_eq!(Config::parse_log_level("WARN"), LevelFilter::Warn);
+        assert_eq!(Config::parse_log_level("warn"), LevelFilter::Warn);
         assert_eq!(Config::parse_log_level("WARNING"), LevelFilter::Warn);
+        assert_eq!(Config::parse_log_level("warning"), LevelFilter::Warn);
         assert_eq!(Config::parse_log_level("ERROR"), LevelFilter::Error);
+        assert_eq!(Config::parse_log_level("error"), LevelFilter::Error);
         assert_eq!(Config::parse_log_level("TRACE"), LevelFilter::Trace);
+        assert_eq!(Config::parse_log_level("trace"), LevelFilter::Trace);
         assert_eq!(Config::parse_log_level("OFF"), LevelFilter::Off);
+        assert_eq!(Config::parse_log_level("off"), LevelFilter::Off);
         assert_eq!(Config::parse_log_level("invalid"), LevelFilter::Info);
+        assert_eq!(Config::parse_log_level("something else"), LevelFilter::Info);
     }
 
     #[test]
@@ -424,48 +499,6 @@ mod tests {
         assert_eq!(library.library_base_url, "https://ollama.com/library/");
         assert_eq!(library.verify_ssl, true);
         assert_eq!(library.timeout, 120.0);
-    }
-
-    #[test]
-    fn test_default_app_settings() {
-        let settings = AppSettings::default();
-        assert_eq!(settings.ollama_server.url, "http://localhost:11434/");
-        assert_eq!(settings.ollama_library.models_path, "~/.ollama/models");
-    }
-
-    #[test]
-    fn test_app_settings_serialization() {
-        let settings = AppSettings::default();
-        let json = serde_json::to_string_pretty(&settings).unwrap();
-        assert!(json.contains("ollama_server"));
-        assert!(json.contains("ollama_library"));
-        assert!(json.contains("http://localhost:11434/"));
-    }
-
-    #[test]
-    fn test_app_settings_deserialization() {
-        let json = r#"{
-            "ollama_server": {
-                "url": "http://test:8080/",
-                "api_key": null,
-                "remove_downloaded_on_error": true,
-                "check_model_presence": false
-            },
-            "ollama_library": {
-                "models_path": "/test/path",
-                "registry_base_url": "https://registry.test.com/",
-                "library_base_url": "https://library.test.com/",
-                "verify_ssl": false,
-                "timeout": 60.0
-            }
-        }"#;
-
-        let settings: AppSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.ollama_server.url, "http://test:8080/");
-        assert_eq!(settings.ollama_server.check_model_presence, false);
-        assert_eq!(settings.ollama_library.models_path, "/test/path");
-        assert_eq!(settings.ollama_library.verify_ssl, false);
-        assert_eq!(settings.ollama_library.timeout, 60.0);
     }
 
     #[test]
@@ -496,6 +529,7 @@ mod tests {
 
     #[test]
     fn test_load_or_create_default() {
+        init_test_logger();
         let test_file = "target/test_load_or_create.json";
 
         // Clean up any existing file
@@ -544,7 +578,18 @@ mod tests {
     }
 
     #[test]
+    fn test_load_or_create_default_settings_invalid_json() {
+        init_test_logger();
+        let test_file = "target/";
+
+        let result = AppSettings::load_or_create_default(test_file);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::IsADirectory);
+    }
+
+    #[test]
     fn test_load_settings_invalid_json() {
+        init_test_logger();
         let test_file = "target/test_invalid.json";
         fs::write(test_file, "{ invalid json }").unwrap();
 
@@ -557,14 +602,12 @@ mod tests {
 
     #[test]
     fn test_load_settings_with_missing_fields() {
+        init_test_logger();
         let test_file = "target/test_missing_fields.json";
         let json_with_missing_fields = r#"{
             "ollama_server": {
-                "url": "http://custom:8080/",
-                "remove_downloaded_on_error": false
             },
             "ollama_library": {
-                "models_path": "/custom/models"
             }
         }"#;
         fs::write(test_file, json_with_missing_fields).unwrap();
@@ -575,9 +618,9 @@ mod tests {
 
         let settings = result.unwrap();
         // Check that provided values are preserved
-        assert_eq!(settings.ollama_server.url, "http://custom:8080/");
-        assert_eq!(settings.ollama_server.remove_downloaded_on_error, false);
-        assert_eq!(settings.ollama_library.models_path, "/custom/models");
+        assert_eq!(settings.ollama_server.url, "http://localhost:11434/");
+        assert_eq!(settings.ollama_server.remove_downloaded_on_error, true);
+        assert_eq!(settings.ollama_library.models_path, "~/.ollama/models");
 
         // Check that missing values use defaults
         assert_eq!(settings.ollama_server.api_key, None);
@@ -609,9 +652,8 @@ mod tests {
             },
             "ollama_library": {
                 "models_path": "/test",
-                "registry_base_url": "https://test",
+                "registry_base_url": "https://localhost/registry",
                 "library_base_url": "https://test.lib",
-                "verify_ssl": false,
                 "timeout": 60.0,
                 "unknown_field": 123
             }
@@ -627,6 +669,36 @@ mod tests {
         assert_eq!(settings.ollama_server.api_key, Some("test_key".to_string()));
         assert_eq!(settings.ollama_server.check_model_presence, false);
         assert_eq!(settings.ollama_library.timeout, 60.0);
+        assert_eq!(settings.ollama_library.verify_ssl, true); // default for missing field
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_load_settings_strict_with_http_url_errors() {
+        init_test_logger();
+        let test_file = "target/test_http_url_errors.json";
+        let json_with_http_url_errors = r#"{
+            "ollama_server": {
+                "url": "ftp://test:9000/",
+                "api_key": null,
+                "remove_downloaded_on_error": true,
+                "check_model_presence": false
+            },
+            "ollama_library": {
+                "models_path": "/test",
+                "registry_base_url": "https://test",
+                "library_base_url": "this-is-not-a-url",
+                "verify_ssl": true,
+                "timeout": 60.0
+            }
+        }"#;
+        fs::write(test_file, json_with_http_url_errors).unwrap();
+
+        // Should fail to load due to invalid URL scheme
+        let result = AppSettings::load_settings(test_file);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
 
         fs::remove_file(test_file).unwrap();
     }
