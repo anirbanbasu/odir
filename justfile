@@ -79,7 +79,7 @@ test:
 # Generate test coverage report and show in browser
 coverage-and-show-in-browser:
     @echo "Generating test coverage report and opening it in browser..."
-    @cargo llvm-cov --html --open
+    @cargo llvm-cov --all-targets --html --open
     @echo "Coverage report generated and opened in browser."
 
 # Count lines of code and documentation

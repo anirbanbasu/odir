@@ -279,10 +279,7 @@ impl AppSettings {
             );
             ollama_library.insert(
                 "timeout".to_string(),
-                Value::Number(
-                    serde_json::Number::from_f64(defaults.timeout)
-                        .unwrap_or_else(|| serde_json::Number::from(120)),
-                ),
+                Value::Number(serde_json::Number::from_f64(defaults.timeout).unwrap()),
             );
         }
 
@@ -394,22 +391,29 @@ impl Config {
 /// Creates the config directory if it doesn't exist.
 ///
 /// # Returns
-/// * `PathBuf` - Path to the settings file
-///
-/// # Panics
-/// Panics if the config directory cannot be determined or created.
-pub fn get_settings_file_path() -> PathBuf {
+/// * `Result<PathBuf, io::Error>` - Path to the settings file or error
+pub fn get_settings_file_path() -> Result<PathBuf, io::Error> {
     let proj_dirs =
         ProjectDirs::from("", "", "odir").expect("Failed to determine config directory");
 
-    let config_dir = proj_dirs.config_dir();
+    get_settings_file_path_for_dir(proj_dirs.config_dir())
+}
 
-    // Create the directory if it doesn't exist
-    if let Err(e) = fs::create_dir_all(config_dir) {
-        panic!("Failed to create config directory: {}", e);
-    }
+/// Get the path to the settings file and panic on error.
+///
+/// # Panics
+/// Panics if the config directory cannot be determined or created.
+pub fn get_settings_file_path_or_panic() -> PathBuf {
+    settings_path_or_panic(get_settings_file_path())
+}
 
-    config_dir.join("settings.json")
+fn get_settings_file_path_for_dir(config_dir: &Path) -> Result<PathBuf, io::Error> {
+    fs::create_dir_all(config_dir)?;
+    Ok(config_dir.join("settings.json"))
+}
+
+fn settings_path_or_panic(result: Result<PathBuf, io::Error>) -> PathBuf {
+    result.unwrap_or_else(|e| panic!("Failed to create config directory: {}", e))
 }
 
 /// Get the user agent string for HTTP requests.
@@ -426,6 +430,7 @@ pub fn get_user_agent() -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use tempfile::tempdir;
 
     /// Initialize logger for tests to enable log coverage
     fn init_test_logger() {
@@ -477,6 +482,22 @@ mod tests {
         assert_eq!(Config::parse_log_level("off"), LevelFilter::Off);
         assert_eq!(Config::parse_log_level("invalid"), LevelFilter::Info);
         assert_eq!(Config::parse_log_level("something else"), LevelFilter::Info);
+    }
+
+    #[test]
+    fn test_from_env_cleanup_removes_vars() {
+        unsafe {
+            env::set_var("OD_LOG_LEVEL", "debug");
+            env::set_var("ODIR_LOG_LEVEL", "warn");
+        }
+
+        let config = Config::from_env();
+        assert_eq!(config.log_level, LevelFilter::Warn);
+
+        unsafe {
+            env::remove_var("ODIR_LOG_LEVEL");
+            env::remove_var("OD_LOG_LEVEL");
+        }
     }
 
     #[test]
@@ -701,5 +722,52 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
 
         fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_get_settings_file_path() {
+        let path = get_settings_file_path().expect("Settings path should be created");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("settings.json")
+        );
+
+        let parent = path
+            .parent()
+            .expect("Settings path should have a parent directory");
+        assert!(parent.exists());
+    }
+
+    #[test]
+    fn test_get_settings_file_path_error() {
+        let temp_dir = tempdir().expect("Temp dir should be created");
+        let file_path = temp_dir.path().join("not_a_dir");
+        fs::write(&file_path, "not a directory").unwrap();
+
+        let result = get_settings_file_path_for_dir(&file_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_settings_file_path_or_panic_success() {
+        let path = get_settings_file_path_or_panic();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("settings.json")
+        );
+        let parent = path
+            .parent()
+            .expect("Settings path should have a parent directory");
+        assert!(parent.exists());
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to create config directory:")]
+    fn test_get_settings_file_path_or_panic_panic() {
+        let temp_dir = tempdir().expect("Temp dir should be created");
+        let file_path = temp_dir.path().join("not_a_dir");
+        fs::write(&file_path, "not a directory").unwrap();
+
+        let _ = settings_path_or_panic(get_settings_file_path_for_dir(&file_path));
     }
 }

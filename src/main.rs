@@ -313,7 +313,7 @@ fn main() {
         "Configuration loaded: log_level={:?}, user_agent={}, settings_file={:?}",
         config.log_level,
         config::get_user_agent(),
-        config::get_settings_file_path()
+        config::get_settings_file_path_or_panic()
     );
 
     // Install signal handlers for graceful shutdown
@@ -334,13 +334,13 @@ fn main() {
 
     match cli.command {
         Commands::ShowConfig => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
                 Ok(settings) => match serde_json::to_string_pretty(&settings) {
                     Ok(json) => {
                         println!("{}", json);
                         info!(
                             "Settings loaded from {:?}",
-                            config::get_settings_file_path()
+                            config::get_settings_file_path_or_panic()
                         );
                     }
                     Err(e) => {
@@ -351,7 +351,7 @@ fn main() {
                 Err(e) => {
                     error!(
                         "Failed to load or create settings file '{:?}': {}",
-                        config::get_settings_file_path(),
+                        config::get_settings_file_path_or_panic(),
                         e
                     );
                     // Provide helpful guidance to the user
@@ -370,7 +370,7 @@ fn main() {
             let config_path = config_file
                 .as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(config::get_settings_file_path);
+                .unwrap_or_else(config::get_settings_file_path_or_panic);
 
             // Try to load existing settings from the config file
             let existing_settings = if config_path.exists() {
@@ -430,7 +430,7 @@ fn main() {
             }
         }
         Commands::ListModels { page, page_size } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
                 Ok(settings) => match OllamaModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.list_available_models(page, page_size) {
                         Ok(models) => {
@@ -462,7 +462,7 @@ fn main() {
             }
         }
         Commands::ListTags { model_identifier } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
                 Ok(settings) => match OllamaModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
                         Ok(tags) => {
@@ -485,7 +485,7 @@ fn main() {
             }
         }
         Commands::ModelDownload { model_tag } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
                 Ok(settings) => match OllamaModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.download_model(&model_tag) {
                         Ok(_) => {
@@ -512,7 +512,7 @@ fn main() {
             }
         }
         Commands::HfListModels { page, page_size } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
                 Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
                     Ok(downloader) => {
                         match downloader.list_available_models(Some(page), Some(page_size)) {
@@ -542,7 +542,7 @@ fn main() {
             }
         }
         Commands::HfListTags { model_identifier } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
                 Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
                         Ok(tags) => {
@@ -568,7 +568,7 @@ fn main() {
             }
         }
         Commands::HfModelDownload { user_repo_quant } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path()) {
+            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
                 Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
                     Ok(downloader) => match downloader.download_model(&user_repo_quant) {
                         Ok(_) => {
@@ -605,7 +605,7 @@ fn main() {
             use std::path::Path;
 
             let source_path = Path::new(&od_settings_file);
-            let dest_path = config::get_settings_file_path();
+            let dest_path = config::get_settings_file_path_or_panic();
 
             // Check if source file exists
             if !source_path.exists() {
