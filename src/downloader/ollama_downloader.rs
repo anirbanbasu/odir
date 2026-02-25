@@ -481,4 +481,36 @@ mod tests {
         let downloader = OllamaModelDownloader::new(settings);
         assert!(downloader.is_ok());
     }
+
+    #[test]
+    fn test_ollama_list_models() {
+        let settings = AppSettings::default();
+        let downloader = OllamaModelDownloader::new(settings).expect("Failed to create downloader");
+
+        let result = downloader.list_available_models(None, None);
+
+        assert!(result.is_ok(), "list_available_models should succeed");
+        let models = result.unwrap();
+        assert!(!models.is_empty(), "Should return at least some models");
+    }
+
+    #[test]
+    fn test_ollama_list_tags() {
+        let settings = AppSettings::default();
+        let downloader = OllamaModelDownloader::new(settings).expect("Failed to create downloader");
+
+        // Use a known model that should exist
+        let model = "llama3.2";
+        let result = downloader.list_model_tags(model);
+
+        assert!(
+            result.is_ok(),
+            "list_model_tags should succeed for a valid model"
+        );
+        let tags = result.unwrap();
+        assert!(
+            !tags.is_empty(),
+            "Should return at least some tags for the model"
+        );
+    }
 }

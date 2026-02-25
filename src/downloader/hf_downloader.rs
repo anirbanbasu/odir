@@ -522,4 +522,38 @@ mod tests {
         let downloader = HuggingFaceModelDownloader::new(settings);
         assert!(downloader.is_ok());
     }
+
+    #[test]
+    fn test_hf_list_models() {
+        let settings = AppSettings::default();
+        let downloader =
+            HuggingFaceModelDownloader::new(settings).expect("Failed to create downloader");
+
+        let result = downloader.list_available_models(None, None);
+
+        assert!(result.is_ok(), "list_available_models should succeed");
+        let models = result.unwrap();
+        assert!(!models.is_empty(), "Should return at least some models");
+    }
+
+    #[test]
+    fn test_hf_list_tags() {
+        let settings = AppSettings::default();
+        let downloader =
+            HuggingFaceModelDownloader::new(settings).expect("Failed to create downloader");
+
+        // Use a known HuggingFace model with Ollama support
+        let model = "bartowski/Llama-3.2-1B-Instruct-GGUF";
+        let result = downloader.list_model_tags(model);
+
+        assert!(
+            result.is_ok(),
+            "list_model_tags should succeed for a valid model"
+        );
+        let tags = result.unwrap();
+        assert!(
+            !tags.is_empty(),
+            "Should return at least some tags for the model"
+        );
+    }
 }

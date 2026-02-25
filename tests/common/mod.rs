@@ -131,15 +131,3 @@ pub fn should_run_integration_tests() -> bool {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
-
-/// Check if a string contains any of the given patterns
-///
-/// # Arguments
-/// * `text` - The text to search in
-/// * `patterns` - The patterns to search for
-///
-/// # Returns
-/// * `bool` - true if any pattern is found
-pub fn contains_any(text: &str, patterns: &[&str]) -> bool {
-    patterns.iter().any(|&pattern| text.contains(pattern))
-}
