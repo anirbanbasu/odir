@@ -33,7 +33,7 @@ const STYLES: Styles = Styles::styled()
 #[command(version, about)]
 // #[command(disable_help_subcommand = false)]
 #[command(styles = STYLES)]
-#[command(override_usage = "odir [OPTIONS] <COMMAND> [ARGS]...")]
+// #[command(override_usage = "odir <COMMAND> [OPTIONS]... [ARGS]...")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
