@@ -522,31 +522,4 @@ mod tests {
         let downloader = HuggingFaceModelDownloader::new(settings);
         assert!(downloader.is_ok());
     }
-
-    #[test]
-    #[ignore] // Run manually with: cargo test -- --ignored
-    fn test_hf_model_download() {
-        // Initialize logger for test output
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let settings = AppSettings::default();
-        let downloader =
-            HuggingFaceModelDownloader::new(settings).expect("Failed to create downloader");
-
-        // Download a small model for testing
-        let model_identifier = "unsloth/SmolLM2-135M-Instruct-GGUF:Q4_K_M";
-        println!("Testing download of {}", model_identifier);
-
-        let result = downloader.download_model(model_identifier);
-
-        match result {
-            Ok(success) => {
-                assert!(success, "Download should return true on success");
-                println!("Successfully downloaded {}", model_identifier);
-            }
-            Err(e) => {
-                panic!("Download failed: {:?}", e);
-            }
-        }
-    }
 }

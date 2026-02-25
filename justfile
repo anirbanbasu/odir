@@ -76,11 +76,23 @@ test:
     @cargo test
     @echo "Tests complete."
 
+# Run comprehensive tests, including those that require Ollama and network connection
+test-comprehensive:
+    @echo "Running all tests, including those that require Ollama and network connection..."
+    @RUN_INTEGRATION_TESTS=1 cargo test -- --include-ignored
+    @echo "All tests complete."
+
 # Generate test coverage report and show in browser
 coverage-and-show-in-browser:
     @echo "Generating test coverage report and opening it in browser..."
     @cargo llvm-cov --all-targets --html --open
     @echo "Coverage report generated and opened in browser."
+
+# Generate comprehensive test coverage report (including integration tests) and show in browser
+coverage-comprehensive-and-show-in-browser:
+    @echo "Generating comprehensive test coverage report (including integration tests) and opening it in browser..."
+    @RUN_INTEGRATION_TESTS=1 cargo llvm-cov --all-targets --html --open -- --include-ignored
+    @echo "Comprehensive coverage report generated and opened in browser."
 
 # Count lines of code and documentation
 count-lines:

@@ -481,30 +481,4 @@ mod tests {
         let downloader = OllamaModelDownloader::new(settings);
         assert!(downloader.is_ok());
     }
-
-    #[test]
-    #[ignore] // Run manually with: cargo test -- --ignored
-    fn test_ollama_model_download() {
-        // Initialize logger for test output
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let settings = AppSettings::default();
-        let downloader = OllamaModelDownloader::new(settings).expect("Failed to create downloader");
-
-        // Download a small model for testing
-        let model_identifier = "all-minilm:22m";
-        println!("Testing download of {}", model_identifier);
-
-        let result = downloader.download_model(model_identifier);
-
-        match result {
-            Ok(success) => {
-                assert!(success, "Download should return true on success");
-                println!("Successfully downloaded {}", model_identifier);
-            }
-            Err(e) => {
-                panic!("Download failed: {:?}", e);
-            }
-        }
-    }
 }

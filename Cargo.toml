@@ -24,3 +24,6 @@ libc = "0.2"
 signal-hook = "0.4"
 crossterm = "0.29"
 url = "2.5.8"
+
+[dev-dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
