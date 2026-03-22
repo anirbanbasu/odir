@@ -70,17 +70,31 @@ generate-docs-and-show-in-browser:
     @cargo doc --no-deps --open
     @echo "Documentation generated and opened in browser."
 
+export RUN_INTEGRATION_TESTS := "1"
+
+# Run comprehensive tests, including downloading models
+test-comprehensive $RUN_INTEGRATION_TESTS="1":
+    @echo "Running all tests, including downloading models..."
+    @cargo test -- --include-ignored
+    @echo "All tests complete."
+
+# Generate comprehensive test coverage report (including integration tests) and show in browser
+coverage-comprehensive-and-show-in-browser $RUN_INTEGRATION_TESTS="1":
+    @echo "Generating comprehensive test coverage report (including integration tests) and opening it in browser..."
+    @cargo llvm-cov --all-targets --html --open -- --include-ignored
+    @echo "Comprehensive coverage report generated and opened in browser."
+
 # Run tests
-test:
+test $RUN_INTEGRATION_TESTS="0":
     @echo "Running tests..."
     @cargo test
     @echo "Tests complete."
 
-# Generate test coverage report
-coverage:
-    @echo "Generating test coverage report..."
-    @cargo llvm-cov --html
-    @echo "Coverage report generated. Open target/llvm-cov/html/index.html to view."
+# Generate test coverage report and show in browser
+coverage-and-show-in-browser $RUN_INTEGRATION_TESTS="0":
+    @echo "Generating test coverage report and opening it in browser..."
+    @cargo llvm-cov --all-targets --html --open
+    @echo "Coverage report generated and opened in browser."
 
 # Count lines of code and documentation
 count-lines:

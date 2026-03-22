@@ -1,4 +1,4 @@
-# Ollama Downloader in Rust (ODIR or _oh dear_!)
+# Ollama Downloader in Rust (ODIR or _oh dear_)
 
 [![Rust tests](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml) [![Markdown Lint](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml) [![CodeQL Advanced](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/anirbanbasu/odir/badge)](https://scorecard.dev/viewer/?uri=github.com/anirbanbasu/odir) [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/11975/badge)](https://www.bestpractices.dev/projects/11975)
 
@@ -109,9 +109,9 @@ odir --help
 The output will be as follows.
 
 ```bash
-A command-line interface for the Ollama Downloader in Rust (ODIR), which is a Rust port and successor of the Python-based [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader)
+Ollama Downloader in Rust (ODIR), pronounced oh dear, is a command-line tool written in Rust for downloading models from Ollama.
 
-Usage: odir [OPTIONS] <COMMAND> [ARGS]...
+Usage: odir <COMMAND>
 
 Commands:
   show-config        Shows the application configuration as JSON
