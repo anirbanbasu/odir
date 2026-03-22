@@ -49,7 +49,7 @@ fn test_hf_interrupt_handling() {
     thread::sleep(Duration::from_secs(2));
 
     println!("Sending SIGINT to process...");
-    common::send_sigint(&child);
+    common::send_sigint(&mut child);
 
     // Give it time to handle the signal
     thread::sleep(Duration::from_secs(1));
@@ -60,7 +60,7 @@ fn test_hf_interrupt_handling() {
         println!("Process exited with status: {:?}", status);
     } else {
         println!("Process didn't exit after SIGINT, sending SIGTERM...");
-        common::send_sigterm(&child);
+        common::send_sigterm(&mut child);
 
         if let Some(status) = common::wait_with_timeout(&mut child, 5) {
             println!("Process exited after SIGTERM with status: {:?}", status);
@@ -189,7 +189,7 @@ fn test_hf_sigterm_handling() {
     thread::sleep(Duration::from_secs(2));
 
     println!("Sending SIGTERM to process...");
-    common::send_sigterm(&child);
+    common::send_sigterm(&mut child);
 
     // Give it time to handle the signal and clean up
     thread::sleep(Duration::from_secs(1));

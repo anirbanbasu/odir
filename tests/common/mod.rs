@@ -7,9 +7,19 @@ use std::time::Duration;
 
 /// Get the path to the compiled odir binary
 ///
-/// This looks for the binary in the target/debug directory.
-/// The binary must be built before running integration tests.
+/// Prefer Cargo's `CARGO_BIN_EXE_odir` path, which is profile/target-dir aware.
+/// Fall back to a local target/debug lookup for non-Cargo invocations.
 pub fn get_binary_path() -> PathBuf {
+    if let Some(binary) = std::env::var_os("CARGO_BIN_EXE_odir") {
+        let binary_path = PathBuf::from(binary);
+        assert!(
+            binary_path.exists(),
+            "Binary from CARGO_BIN_EXE_odir not found at {:?}",
+            binary_path
+        );
+        return binary_path;
+    }
+
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let mut binary_path = PathBuf::from(manifest_dir);
     binary_path.push("target");
@@ -23,7 +33,7 @@ pub fn get_binary_path() -> PathBuf {
 
     assert!(
         binary_path.exists(),
-        "Binary not found at {:?}. Please build the project first with 'cargo build'",
+        "Binary not found at {:?}. Run integration tests through Cargo so CARGO_BIN_EXE_odir is set, or build the binary first",
         binary_path
     );
 
@@ -54,7 +64,7 @@ pub fn spawn_odir(args: &[&str]) -> Child {
 /// # Panics
 /// Panics if unable to send the signal
 #[cfg(unix)]
-pub fn send_sigint(child: &Child) {
+pub fn send_sigint(child: &mut Child) {
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
 
@@ -79,7 +89,7 @@ pub fn send_sigint(child: &mut Child) {
 /// # Panics
 /// Panics if unable to send the signal
 #[cfg(unix)]
-pub fn send_sigterm(child: &Child) {
+pub fn send_sigterm(child: &mut Child) {
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
 
