@@ -122,7 +122,8 @@ pub fn wait_with_timeout(child: &mut Child, timeout_secs: u64) -> Option<std::pr
 /// Check if integration tests should run
 ///
 /// Integration tests are controlled by the environment variable RUN_INTEGRATION_TESTS.
-/// Set RUN_INTEGRATION_TESTS=1 to enable network-dependent integration tests.
+/// Set RUN_INTEGRATION_TESTS=1 to enable network-dependent integration tests. Note that
+/// not all tests that require network access are necessarily marked as integration tests.
 ///
 /// # Returns
 /// * `bool` - true if integration tests should run, false otherwise
