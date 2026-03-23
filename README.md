@@ -67,7 +67,7 @@ Let's explore the configuration in details. The default content is as follows.
         "library_base_url": "https://ollama.com/library",
         "verify_ssl": true,
         "timeout": 120.0,
-        "chunk_size_bytes": 134217728
+        "chunk_size_mb": 128
     }
 }
 ```
@@ -88,7 +88,7 @@ There are two main configuration groups: `ollama_server` and `ollama_library`. T
 - Likewise, the `library_base_url` is the URL to the Ollama library. Keep the default value unless you really need to point it to some mirror.
 - The `verify_ssl` is a flag that tells the downloader tool to verify the authenticity of the HTTPS connections it makes to the Ollama registry or the library. Turn this off only if you have a man-in-the-middle proxy with self-signed certificates. Even in that case, typically environment variables `SSL_CERT_FILE` and `SSL_CERT_DIR` can be correctly configured to validate such certificates.
 - The self-explanatory `timeout` specifies the number of seconds to wait before any HTTPS connection to the Ollama registry or library should be allowed to fail.
-- The `chunk_size_bytes` controls the size (in bytes) of each part when downloading large model blobs. Large blobs are split into sequential byte-range requests of this size, which makes downloads more robust over unreliable connections. If a download is interrupted by a network error, only the missing parts will be re-fetched on the next run. Set to `0` to disable chunked downloading and download each blob in a single stream. The default is `134217728` (128 MiB). Note that if the remote server does not advertise `Accept-Ranges: bytes` support, or if the blob is smaller than `chunk_size_bytes`, the download will automatically fall back to single-stream mode regardless of this setting.
+- The `chunk_size_mb` controls the size (in MiB) of each chunk when downloading large model blobs. Large blobs are split into sequential byte-range requests of this size, which makes downloads more robust over unreliable connections. If a download is interrupted by a network error, only the missing parts will be re-fetched on the next run. Set to `0` to disable chunked downloading and download each blob in a single stream. The value must be one of `0`, `32`, `64`, `128`, `256`, or `512`. The default is `128` (128 MiB). Note that if the remote server does not support chunked downloading, or if the blob is smaller than the configured chunk size, the download will automatically fall back to single-stream mode regardless of this setting.
 
 ## Environment variables
 

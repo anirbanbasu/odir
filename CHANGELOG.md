@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ### Added
 
-- Improved coverage but this is still on-going.
+- Improved coverage but this is still ongoing.
 - Added support for chunked downloading of large model blobs, which makes downloads more robust over unreliable connections.
 
 ### Changed

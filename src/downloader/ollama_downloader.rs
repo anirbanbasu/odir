@@ -100,7 +100,7 @@ impl OllamaModelDownloader {
         let blobs_dir = expand_models_path(&self.settings.ollama_library.models_path)
             .ok()
             .map(|p| p.join("blobs"));
-        let chunk_size = self.settings.ollama_library.chunk_size_bytes;
+        let chunk_size = self.settings.ollama_library.chunk_size_mb * 1024 * 1024;
         download_model_blob(
             &self.client,
             &url,
@@ -108,6 +108,7 @@ impl OllamaModelDownloader {
             &mut self.unnecessary_files,
             chunk_size,
             blobs_dir.as_deref(),
+            self.models_dir_ownership,
         )
     }
 

@@ -20,6 +20,10 @@ pub enum HttpUrlParseError {
     /// URL scheme is not http or https.
     #[error("URL scheme should either be http or https, got: {0}")]
     InvalidScheme(String),
+
+    /// chunk_size_mb is not one of the allowed values.
+    #[error("chunk_size_mb must be one of [0, 32, 64, 128, 256, 512], got: {0}")]
+    InvalidChunkSizeMb(u64),
 }
 
 pub fn validate_string_as_http_url(url_str: &str) -> Result<Url, HttpUrlParseError> {
@@ -76,10 +80,11 @@ pub struct OllamaLibrary {
     /// Timeout for HTTP requests in seconds.
     pub timeout: f64,
 
-    /// Size in bytes for each chunk when downloading large blobs in parts.
+    /// Size in MiB for each chunk when downloading large blobs in parts.
+    /// Must be one of [0, 32, 64, 128, 256, 512].
     /// Set to 0 to disable chunked downloading and download blobs in one stream.
-    /// Default is 134217728 (128 MiB).
-    pub chunk_size_bytes: u64,
+    /// Default is 128 (128 MiB).
+    pub chunk_size_mb: u64,
 }
 
 impl Default for OllamaLibrary {
@@ -90,7 +95,7 @@ impl Default for OllamaLibrary {
             library_base_url: "https://ollama.com/library/".to_string(),
             verify_ssl: true,
             timeout: 120.0,
-            chunk_size_bytes: 134_217_728, // 128 MiB
+            chunk_size_mb: 128,
         }
     }
 }
@@ -114,6 +119,12 @@ impl AppSettings {
         validate_string_as_http_url(&self.ollama_server.url)?;
         validate_string_as_http_url(&self.ollama_library.registry_base_url)?;
         validate_string_as_http_url(&self.ollama_library.library_base_url)?;
+        const VALID_CHUNK_SIZES_MB: &[u64] = &[0, 32, 64, 128, 256, 512];
+        if !VALID_CHUNK_SIZES_MB.contains(&self.ollama_library.chunk_size_mb) {
+            return Err(HttpUrlParseError::InvalidChunkSizeMb(
+                self.ollama_library.chunk_size_mb,
+            ));
+        }
         Ok(())
     }
 
@@ -288,14 +299,14 @@ impl AppSettings {
                 Value::Number(serde_json::Number::from_f64(defaults.timeout).unwrap()),
             );
         }
-        if !ollama_library.contains_key("chunk_size_bytes") {
+        if !ollama_library.contains_key("chunk_size_mb") {
             warn!(
-                "Missing field 'ollama_library.chunk_size_bytes', using default: {}",
-                defaults.chunk_size_bytes
+                "Missing field 'ollama_library.chunk_size_mb', using default: {}",
+                defaults.chunk_size_mb
             );
             ollama_library.insert(
-                "chunk_size_bytes".to_string(),
-                Value::Number(serde_json::Number::from(defaults.chunk_size_bytes)),
+                "chunk_size_mb".to_string(),
+                Value::Number(serde_json::Number::from(defaults.chunk_size_mb)),
             );
         }
 

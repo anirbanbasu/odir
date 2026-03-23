@@ -168,6 +168,7 @@ pub fn download_model_blob(
     unnecessary_files: &mut HashSet<PathBuf>,
     chunk_size_bytes: u64,
     blobs_dir: Option<&Path>,
+    models_dir_ownership: Option<Ownership>,
 ) -> Result<(PathBuf, String)> {
     // Check for interruption before starting download
     if crate::signal_handler::is_interrupted() {
@@ -221,10 +222,15 @@ pub fn download_model_blob(
             }
         }
 
-        if !range_supported {
+        // Run the active probe when range support is not yet confirmed, OR when
+        // HEAD confirmed it but omitted Content-Length (total_size == 0). The
+        // probe's Content-Range response gives us the total size in both cases.
+        if !range_supported || total_size == 0 {
             let (probe_supported, probe_total_size) =
                 probe_byte_range_support(client, url, named_digest);
-            range_supported = probe_supported;
+            if !range_supported {
+                range_supported = probe_supported;
+            }
             if total_size == 0 {
                 total_size = probe_total_size.unwrap_or(0);
             }
@@ -236,15 +242,16 @@ pub fn download_model_blob(
                     "Using chunked download for {} ({} bytes, {} byte chunks)",
                     named_digest, total_size, chunk_size_bytes
                 );
-                return download_model_blob_chunked(
+                return download_model_blob_chunked(ChunkedBlobDownload {
                     client,
                     url,
                     named_digest,
                     unnecessary_files,
-                    chunk_size_bytes,
+                    chunk_size: chunk_size_bytes,
                     blobs_dir,
                     total_size,
-                );
+                    models_dir_ownership,
+                });
             }
 
             if total_size == 0 {
@@ -443,26 +450,44 @@ fn is_part_complete(part_path: &Path, expected_size: u64) -> bool {
         .unwrap_or(false)
 }
 
+struct ChunkedBlobDownload<'a> {
+    client: &'a Client,
+    url: &'a str,
+    named_digest: &'a str,
+    unnecessary_files: &'a mut HashSet<PathBuf>,
+    chunk_size: u64,
+    blobs_dir: &'a Path,
+    total_size: u64,
+    models_dir_ownership: Option<Ownership>,
+}
+
 /// Download a blob by fetching it in sequential byte-range parts and assembling
-/// them into a single `NamedTempFile`, verifying the SHA-256 digest on the fly.
+/// them into a single file.
 ///
-/// * **User abort** – the entire parts directory is wiped; callers get a clean slate.
+/// * **User abort without chunk removal** – parts directory is retained; subsequent call can resume from where it left off.
+/// * **User abort with chunk removal** – the entire parts directory is wiped; callers get a clean slate.
 /// * **Network error** – only the incomplete current-part file is removed; already
 ///   downloaded parts are kept so a subsequent call can resume from where it left off.
-fn download_model_blob_chunked(
-    client: &Client,
-    url: &str,
-    named_digest: &str,
-    unnecessary_files: &mut HashSet<PathBuf>,
-    chunk_size: u64,
-    blobs_dir: &Path,
-    total_size: u64,
-) -> Result<(PathBuf, String)> {
+fn download_model_blob_chunked(request: ChunkedBlobDownload<'_>) -> Result<(PathBuf, String)> {
+    let ChunkedBlobDownload {
+        client,
+        url,
+        named_digest,
+        unnecessary_files,
+        chunk_size,
+        blobs_dir,
+        total_size,
+        models_dir_ownership,
+    } = request;
+
     let num_parts = total_size.div_ceil(chunk_size);
     let parts_dir = get_parts_dir(blobs_dir, named_digest);
 
     if !parts_dir.exists() {
         fs::create_dir_all(&parts_dir)?;
+        if let Some(ownership) = models_dir_ownership {
+            ensure_ownership_for_dir_tree(blobs_dir, &parts_dir, ownership);
+        }
         info!("Created parts directory: {:?}", parts_dir);
     }
 
@@ -588,6 +613,9 @@ fn download_model_blob_chunked(
                 return Err(DownloaderError::IoError(e));
             }
         };
+        if let Some(ownership) = models_dir_ownership {
+            ensure_ownership(&part_path, ownership);
+        }
 
         let mut response_reader = response;
         let mut bytes_written: u64 = 0;

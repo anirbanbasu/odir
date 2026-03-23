@@ -30,6 +30,41 @@ enum InterruptDecision {
     Continue,
 }
 
+fn pending_signal_label() -> Option<&'static str> {
+    if !CONFIRMATION_REQUIRED.load(Ordering::Acquire) {
+        return None;
+    }
+
+    if !INTERRUPT_REQUESTED.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+
+    let signal_id = PENDING_SIGNAL.swap(0, Ordering::AcqRel);
+    Some(match signal_id {
+        x if x == SIGTERM as usize => "Termination",
+        _ => "Interrupt",
+    })
+}
+
+fn apply_chunked_interrupt_decision(decision: InterruptDecision) -> bool {
+    match decision {
+        InterruptDecision::ExitAndRemove => {
+            KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
+            set_interrupted();
+            true
+        }
+        InterruptDecision::ExitAndKeep => {
+            KEEP_PARTIAL_DOWNLOADS.store(true, Ordering::Release);
+            set_interrupted();
+            true
+        }
+        InterruptDecision::Continue => {
+            KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
+            false
+        }
+    }
+}
+
 /// Check if an interrupt signal has been received
 pub fn is_interrupted() -> bool {
     INTERRUPTED.load(Ordering::Acquire)
@@ -68,18 +103,8 @@ pub fn interrupt_requested() -> bool {
 /// Prompt the user to confirm interrupt for a pending signal
 /// Returns true if the user confirms the interrupt
 pub fn confirm_pending_interrupt() -> bool {
-    if !CONFIRMATION_REQUIRED.load(Ordering::Acquire) {
+    let Some(label) = pending_signal_label() else {
         return false;
-    }
-
-    if !INTERRUPT_REQUESTED.swap(false, Ordering::AcqRel) {
-        return false;
-    }
-
-    let signal_id = PENDING_SIGNAL.swap(0, Ordering::AcqRel);
-    let label = match signal_id {
-        x if x == SIGTERM as usize => "Termination",
-        _ => "Interrupt",
     };
 
     KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
@@ -97,36 +122,14 @@ pub fn confirm_pending_interrupt() -> bool {
 /// Returns true if the user confirms exit (either removing or keeping partial
 /// downloads), false if the user wants to continue.
 pub fn confirm_pending_interrupt_for_chunked(completed_parts: u64) -> bool {
-    if !CONFIRMATION_REQUIRED.load(Ordering::Acquire) {
+    let Some(label) = pending_signal_label() else {
         return false;
-    }
-
-    if !INTERRUPT_REQUESTED.swap(false, Ordering::AcqRel) {
-        return false;
-    }
-
-    let signal_id = PENDING_SIGNAL.swap(0, Ordering::AcqRel);
-    let label = match signal_id {
-        x if x == SIGTERM as usize => "Termination",
-        _ => "Interrupt",
     };
 
-    match prompt_for_interrupt_confirmation_chunked(label, completed_parts) {
-        InterruptDecision::ExitAndRemove => {
-            KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
-            set_interrupted();
-            true
-        }
-        InterruptDecision::ExitAndKeep => {
-            KEEP_PARTIAL_DOWNLOADS.store(true, Ordering::Release);
-            set_interrupted();
-            true
-        }
-        InterruptDecision::Continue => {
-            KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
-            false
-        }
-    }
+    apply_chunked_interrupt_decision(prompt_for_interrupt_confirmation_chunked(
+        label,
+        completed_parts,
+    ))
 }
 
 /// Prompt the user to confirm interrupt
@@ -454,6 +457,13 @@ mod tests {
     }
 
     #[test]
+    fn test_keep_partial_downloads_initial_state() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+        assert!(!keep_partial_downloads());
+    }
+
+    #[test]
     fn test_interrupt_requested_after_signal() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_flags();
@@ -500,6 +510,69 @@ mod tests {
         assert_eq!(signal_id, SIGTERM as usize);
         assert!(!INTERRUPT_REQUESTED.load(Ordering::Acquire));
         assert_eq!(PENDING_SIGNAL.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_pending_signal_label_returns_none_without_confirmation_required() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+        INTERRUPT_REQUESTED.store(true, Ordering::Release);
+        PENDING_SIGNAL.store(SIGINT as usize, Ordering::Release);
+
+        assert_eq!(pending_signal_label(), None);
+        assert!(INTERRUPT_REQUESTED.load(Ordering::Acquire));
+        assert_eq!(PENDING_SIGNAL.load(Ordering::Acquire), SIGINT as usize);
+    }
+
+    #[test]
+    fn test_pending_signal_label_consumes_sigterm_request() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+        set_confirmation_required(true);
+        INTERRUPT_REQUESTED.store(true, Ordering::Release);
+        PENDING_SIGNAL.store(SIGTERM as usize, Ordering::Release);
+
+        assert_eq!(pending_signal_label(), Some("Termination"));
+        assert!(!INTERRUPT_REQUESTED.load(Ordering::Acquire));
+        assert_eq!(PENDING_SIGNAL.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_apply_chunked_interrupt_decision_exit_and_remove() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+        KEEP_PARTIAL_DOWNLOADS.store(true, Ordering::Release);
+
+        assert!(apply_chunked_interrupt_decision(
+            InterruptDecision::ExitAndRemove,
+        ));
+        assert!(is_interrupted());
+        assert!(!keep_partial_downloads());
+    }
+
+    #[test]
+    fn test_apply_chunked_interrupt_decision_exit_and_keep() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+
+        assert!(apply_chunked_interrupt_decision(
+            InterruptDecision::ExitAndKeep,
+        ));
+        assert!(is_interrupted());
+        assert!(keep_partial_downloads());
+    }
+
+    #[test]
+    fn test_apply_chunked_interrupt_decision_continue_resets_keep_flag() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+        KEEP_PARTIAL_DOWNLOADS.store(true, Ordering::Release);
+
+        assert!(!apply_chunked_interrupt_decision(
+            InterruptDecision::Continue
+        ));
+        assert!(!is_interrupted());
+        assert!(!keep_partial_downloads());
     }
 
     #[test]
