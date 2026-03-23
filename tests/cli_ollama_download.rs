@@ -19,6 +19,8 @@
 
 mod common;
 
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -116,6 +118,98 @@ fn test_ollama_download_success() {
     );
 
     println!("Download completed successfully!");
+}
+
+/// Test downloading a larger Ollama model via CLI using part downloads.
+///
+/// Model under test: `gemma3:270m`
+///
+/// Run explicitly with:
+///
+/// ```bash
+/// RUN_INTEGRATION_TESTS=1 cargo test --test cli_ollama_download test_ollama_large_model_part_download -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn test_ollama_large_model_part_download() {
+    if !common::should_run_integration_tests() {
+        println!("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.");
+        return;
+    }
+
+    println!("Testing larger Ollama model download (part download expected)...");
+
+    let model = "gemma3:270m";
+    let mut child = common::spawn_odir(&["model-download", model]);
+
+    println!("Spawned large-model download process, PID: {}", child.id());
+
+    let status = common::wait_with_timeout(&mut child, 1200) // 20 minutes timeout
+        .expect("Large-model download process did not complete within timeout");
+
+    println!("Process exited with status: {:?}", status);
+
+    assert!(
+        status.success(),
+        "Large Ollama download should exit successfully, but exited with: {:?}",
+        status
+    );
+
+    println!("Large Ollama model download completed successfully!");
+}
+
+/// Lightweight non-interactive check for part-download mode indicator in output.
+///
+/// This test starts the larger Ollama model download, lets it run briefly,
+/// terminates the process, and asserts that output indicates part-download
+/// mode (either explicit chunked log or per-part progress message).
+#[test]
+#[ignore]
+fn test_ollama_large_model_mode_indicator_non_interactive() {
+    if !common::should_run_integration_tests() {
+        println!("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.");
+        return;
+    }
+
+    println!("Testing Ollama mode indicator output (non-interactive)...");
+
+    let model = "gemma3:270m";
+    let mut child = Command::new(common::get_binary_path())
+        .args(["model-download", model])
+        .env("ODIR_LOG_LEVEL", "DEBUG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn odir process");
+
+    // Allow enough time for mode-detection logs/progress to appear.
+    thread::sleep(Duration::from_secs(12));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+
+    let combined = format!("{}\n{}", stdout, stderr);
+    println!(
+        "Captured output (truncated): {}",
+        &combined.chars().take(2000).collect::<String>()
+    );
+
+    assert!(
+        combined.contains("Using chunked download for")
+            || combined.contains(" part 1/")
+            || combined.contains(" part 2/"),
+        "Expected part-download mode indicator in output, but none was found"
+    );
 }
 
 /// Test that invalid model names are handled correctly

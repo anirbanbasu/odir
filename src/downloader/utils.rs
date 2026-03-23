@@ -4,6 +4,7 @@
 use crate::downloader::model_downloader::{DownloaderError, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -165,6 +166,8 @@ pub fn download_model_blob(
     url: &str,
     named_digest: &str,
     unnecessary_files: &mut HashSet<PathBuf>,
+    chunk_size_bytes: u64,
+    blobs_dir: Option<&Path>,
 ) -> Result<(PathBuf, String)> {
     // Check for interruption before starting download
     if crate::signal_handler::is_interrupted() {
@@ -178,6 +181,86 @@ pub fn download_model_blob(
         return Err(DownloaderError::Other(
             "Download interrupted by user".to_string(),
         ));
+    }
+
+    // If chunked downloading is enabled and we know where the blobs live,
+    // detect byte-range support with a robust probe:
+    // 1) use HEAD hints when available, 2) fall back to active Range probe.
+    if chunk_size_bytes > 0
+        && let Some(blobs_dir) = blobs_dir
+    {
+        let mut total_size: u64 = 0;
+        let mut range_supported = false;
+
+        match client.head(url).send() {
+            Ok(head_resp) if head_resp.status().is_success() => {
+                total_size = head_resp.content_length().unwrap_or(0);
+                range_supported = head_resp
+                    .headers()
+                    .get("accept-ranges")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.eq_ignore_ascii_case("bytes"))
+                    .unwrap_or(false);
+
+                if range_supported {
+                    debug!("HEAD indicates byte-range support for {}", named_digest);
+                }
+            }
+            Ok(head_resp) => {
+                debug!(
+                    "HEAD returned non-success ({}) for {}; trying active range probe",
+                    head_resp.status(),
+                    named_digest
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "HEAD failed for {}: {}; trying active range probe",
+                    named_digest, e
+                );
+            }
+        }
+
+        if !range_supported {
+            let (probe_supported, probe_total_size) =
+                probe_byte_range_support(client, url, named_digest);
+            range_supported = probe_supported;
+            if total_size == 0 {
+                total_size = probe_total_size.unwrap_or(0);
+            }
+        }
+
+        if range_supported {
+            if total_size > chunk_size_bytes {
+                debug!(
+                    "Using chunked download for {} ({} bytes, {} byte chunks)",
+                    named_digest, total_size, chunk_size_bytes
+                );
+                return download_model_blob_chunked(
+                    client,
+                    url,
+                    named_digest,
+                    unnecessary_files,
+                    chunk_size_bytes,
+                    blobs_dir,
+                    total_size,
+                );
+            }
+
+            if total_size == 0 {
+                warn!(
+                    "Byte-range probe succeeded for {}, but total size is unknown; \
+                         falling back to single-stream download",
+                    named_digest
+                );
+            }
+        } else {
+            warn!(
+                "Server does not support byte-range probe for {}; \
+                     falling back to single-stream download",
+                named_digest
+            );
+        }
     }
 
     let mut hasher = Sha256::new();
@@ -265,6 +348,384 @@ pub fn download_model_blob(
 
     Ok((final_path, computed_digest))
 }
+
+/// Parse the complete length from a Content-Range value.
+///
+/// Supported forms:
+/// - `bytes 0-0/12345` -> Some(12345)
+/// - `bytes */12345`   -> Some(12345)
+/// - `bytes 0-0/*`     -> None
+fn parse_total_size_from_content_range(content_range: &str) -> Option<u64> {
+    let (_, total) = content_range.split_once('/')?;
+    let trimmed = total.trim();
+    if trimmed == "*" {
+        None
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
+/// Actively probe byte-range support by requesting a one-byte range.
+///
+/// Returns `(supported, total_size_if_known)`.
+fn probe_byte_range_support(client: &Client, url: &str, named_digest: &str) -> (bool, Option<u64>) {
+    match client.get(url).header("Range", "bytes=0-0").send() {
+        Ok(response) if response.status() == StatusCode::PARTIAL_CONTENT => {
+            let total_size = response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_total_size_from_content_range);
+
+            debug!(
+                "Active byte-range probe succeeded for {} (total size: {:?})",
+                named_digest, total_size
+            );
+            (true, total_size)
+        }
+        Ok(response) if response.status() == StatusCode::RANGE_NOT_SATISFIABLE => {
+            let total_size = response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_total_size_from_content_range);
+
+            debug!(
+                "Active byte-range probe got 416 for {} (total size: {:?})",
+                named_digest, total_size
+            );
+            (true, total_size)
+        }
+        Ok(response) => {
+            debug!(
+                "Active byte-range probe returned {} for {}; treating as unsupported",
+                response.status(),
+                named_digest
+            );
+            (false, None)
+        }
+        Err(e) => {
+            debug!("Active byte-range probe failed for {}: {}", named_digest, e);
+            (false, None)
+        }
+    }
+}
+
+// ─── Chunked / resumable download helpers ────────────────────────────────────
+
+/// Returns the directory that holds in-progress parts for a specific blob.
+/// Layout: `{blobs_dir}/.parts/{named_digest_as_fs_name}/`
+fn get_parts_dir(blobs_dir: &Path, named_digest: &str) -> PathBuf {
+    blobs_dir
+        .join(".parts")
+        .join(named_digest.replace(':', "-"))
+}
+
+/// Zero-padded part filename, e.g. `part_00000003`.
+fn part_file_name(index: u64) -> String {
+    format!("part_{:08}", index)
+}
+
+/// Expected byte count for part `part_idx` out of `num_parts` total.
+fn expected_part_size(part_idx: u64, num_parts: u64, total_size: u64, chunk_size: u64) -> u64 {
+    if part_idx == num_parts - 1 {
+        let rem = total_size % chunk_size;
+        if rem == 0 { chunk_size } else { rem }
+    } else {
+        chunk_size
+    }
+}
+
+/// Returns `true` when the part file exists and has exactly the expected byte count.
+fn is_part_complete(part_path: &Path, expected_size: u64) -> bool {
+    fs::metadata(part_path)
+        .map(|m| m.len() == expected_size)
+        .unwrap_or(false)
+}
+
+/// Download a blob by fetching it in sequential byte-range parts and assembling
+/// them into a single `NamedTempFile`, verifying the SHA-256 digest on the fly.
+///
+/// * **User abort** – the entire parts directory is wiped; callers get a clean slate.
+/// * **Network error** – only the incomplete current-part file is removed; already
+///   downloaded parts are kept so a subsequent call can resume from where it left off.
+fn download_model_blob_chunked(
+    client: &Client,
+    url: &str,
+    named_digest: &str,
+    unnecessary_files: &mut HashSet<PathBuf>,
+    chunk_size: u64,
+    blobs_dir: &Path,
+    total_size: u64,
+) -> Result<(PathBuf, String)> {
+    let num_parts = total_size.div_ceil(chunk_size);
+    let parts_dir = get_parts_dir(blobs_dir, named_digest);
+
+    if !parts_dir.exists() {
+        fs::create_dir_all(&parts_dir)?;
+        info!("Created parts directory: {:?}", parts_dir);
+    }
+
+    // Determine which parts are already complete.
+    let mut already_downloaded: u64 = 0;
+    let mut completed_parts: u64 = 0;
+    let mut missing_parts: Vec<u64> = Vec::new();
+    for part_idx in 0..num_parts {
+        let part_path = parts_dir.join(part_file_name(part_idx));
+        let expected = expected_part_size(part_idx, num_parts, total_size, chunk_size);
+        if is_part_complete(&part_path, expected) {
+            already_downloaded += expected;
+            completed_parts += 1;
+        } else {
+            missing_parts.push(part_idx);
+        }
+    }
+
+    if missing_parts.is_empty() {
+        info!(
+            "All {} parts of {} are already on disk; assembling",
+            num_parts, named_digest
+        );
+    } else {
+        info!(
+            "Downloading {} missing parts for {} ({} of {} parts already complete, {} bytes already on disk)",
+            missing_parts.len(),
+            named_digest,
+            completed_parts,
+            num_parts,
+            already_downloaded
+        );
+    }
+
+    // Progress bar covering the full file, pre-advanced for already-downloaded bytes.
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message(format!(
+        "Downloading BLOB {} part {}/{}",
+        named_digest, completed_parts, num_parts
+    ));
+    pb.set_position(already_downloaded);
+
+    struct ProgressGuard;
+    impl Drop for ProgressGuard {
+        fn drop(&mut self) {
+            crate::signal_handler::set_progress_active(false);
+        }
+    }
+    crate::signal_handler::set_progress_active(true);
+    let _progress_guard = ProgressGuard;
+
+    let mut buffer = [0u8; 8192];
+
+    for &part_idx in &missing_parts {
+        pb.set_message(format!(
+            "Downloading BLOB {} part {}/{}",
+            named_digest,
+            completed_parts + 1,
+            num_parts
+        ));
+
+        let part_path = parts_dir.join(part_file_name(part_idx));
+        let expected_size = expected_part_size(part_idx, num_parts, total_size, chunk_size);
+        let range_start = part_idx * chunk_size;
+        let range_end = range_start + expected_size - 1;
+
+        // Interrupt check before fetching this part.
+        if crate::signal_handler::is_interrupted() {
+            warn!("Download interrupted by user before part {}", part_idx);
+            pb.abandon();
+            if !crate::signal_handler::keep_partial_downloads() {
+                let _ = fs::remove_dir_all(&parts_dir);
+            }
+            return Err(DownloaderError::Other(
+                "Download interrupted by user".to_string(),
+            ));
+        }
+        if crate::signal_handler::interrupt_requested() {
+            let should_exit = pb.suspend(|| {
+                crate::signal_handler::confirm_pending_interrupt_for_chunked(completed_parts)
+            });
+            if should_exit {
+                warn!("Download interrupted by user before part {}", part_idx);
+                pb.abandon();
+                if !crate::signal_handler::keep_partial_downloads() {
+                    let _ = fs::remove_dir_all(&parts_dir);
+                }
+                return Err(DownloaderError::Other(
+                    "Download interrupted by user".to_string(),
+                ));
+            }
+        }
+
+        let range_header = format!("bytes={}-{}", range_start, range_end);
+        let response = match client.get(url).header("Range", &range_header).send() {
+            Ok(r) => r,
+            Err(e) => {
+                pb.abandon();
+                return Err(DownloaderError::HttpError(e));
+            }
+        };
+
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            pb.abandon();
+            let status = response.status();
+            let _ = fs::remove_dir_all(&parts_dir);
+            return Err(DownloaderError::Other(format!(
+                "Expected 206 Partial Content for range request on {}, got {}",
+                named_digest, status
+            )));
+        }
+
+        let mut part_file = match fs::File::create(&part_path) {
+            Ok(f) => f,
+            Err(e) => {
+                pb.abandon();
+                return Err(DownloaderError::IoError(e));
+            }
+        };
+
+        let mut response_reader = response;
+        let mut bytes_written: u64 = 0;
+
+        loop {
+            // Interrupt check inside the read loop.
+            if crate::signal_handler::is_interrupted() {
+                warn!(
+                    "Download interrupted by user while downloading part {}",
+                    part_idx
+                );
+                pb.abandon();
+                drop(part_file);
+                let _ = fs::remove_file(&part_path);
+                if !crate::signal_handler::keep_partial_downloads() {
+                    let _ = fs::remove_dir_all(&parts_dir);
+                }
+                return Err(DownloaderError::Other(
+                    "Download interrupted by user".to_string(),
+                ));
+            }
+            if crate::signal_handler::interrupt_requested() {
+                let should_exit = pb.suspend(|| {
+                    crate::signal_handler::confirm_pending_interrupt_for_chunked(completed_parts)
+                });
+                if should_exit {
+                    warn!(
+                        "Download interrupted by user while downloading part {}",
+                        part_idx
+                    );
+                    pb.abandon();
+                    drop(part_file);
+                    let _ = fs::remove_file(&part_path);
+                    if !crate::signal_handler::keep_partial_downloads() {
+                        let _ = fs::remove_dir_all(&parts_dir);
+                    }
+                    return Err(DownloaderError::Other(
+                        "Download interrupted by user".to_string(),
+                    ));
+                }
+            }
+
+            let bytes_read = match response_reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    // Network error: keep completed parts; remove the incomplete one.
+                    pb.abandon();
+                    drop(part_file);
+                    let _ = fs::remove_file(&part_path);
+                    return Err(DownloaderError::IoError(e));
+                }
+            };
+
+            let chunk = &buffer[..bytes_read];
+            if let Err(e) = part_file.write_all(chunk) {
+                pb.abandon();
+                drop(part_file);
+                let _ = fs::remove_file(&part_path);
+                return Err(DownloaderError::IoError(e));
+            }
+            bytes_written += bytes_read as u64;
+            pb.inc(bytes_read as u64);
+        }
+
+        if bytes_written != expected_size {
+            warn!(
+                "Part {} incomplete: expected {} bytes, got {}",
+                part_idx, expected_size, bytes_written
+            );
+            let _ = fs::remove_file(&part_path);
+            pb.abandon();
+            return Err(DownloaderError::Other(format!(
+                "Part {} of {} incomplete ({}/{} bytes)",
+                part_idx, named_digest, bytes_written, expected_size
+            )));
+        }
+
+        debug!(
+            "Downloaded part {}/{} for {}",
+            part_idx + 1,
+            num_parts,
+            named_digest
+        );
+
+        completed_parts += 1;
+        pb.set_message(format!(
+            "Downloading BLOB {} part {}/{}",
+            named_digest, completed_parts, num_parts
+        ));
+    }
+
+    pb.finish_with_message("Downloaded (assembling parts)");
+
+    // Assemble all parts into a NamedTempFile while computing SHA-256.
+    let mut hasher = Sha256::new();
+    let mut temp_file = NamedTempFile::new()?;
+    let temp_path = temp_file.path().to_path_buf();
+    unnecessary_files.insert(temp_path.clone());
+
+    info!("Assembling {} parts for {}", num_parts, named_digest);
+    for part_idx in 0..num_parts {
+        let part_path = parts_dir.join(part_file_name(part_idx));
+        let mut part_file = fs::File::open(&part_path)?;
+        let mut read_buf = [0u8; 8192];
+        loop {
+            let n = part_file.read(&mut read_buf)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &read_buf[..n];
+            hasher.update(chunk);
+            temp_file.write_all(chunk)?;
+        }
+    }
+
+    let computed_digest = format!("{:x}", hasher.finalize());
+    debug!(
+        "Assembled {} into {:?}, digest: {}",
+        named_digest, temp_path, computed_digest
+    );
+
+    // Parts are no longer needed.
+    if let Err(e) = fs::remove_dir_all(&parts_dir) {
+        warn!("Failed to remove parts directory {:?}: {}", parts_dir, e);
+    } else {
+        debug!("Removed parts directory {:?}", parts_dir);
+    }
+
+    let persisted_path = temp_file.into_temp_path();
+    let final_path = persisted_path
+        .keep()
+        .map_err(|e| DownloaderError::Other(format!("Failed to persist temp file: {}", e)))?;
+
+    Ok((final_path, computed_digest))
+}
+
+// ─── Blob / manifest persistence ─────────────────────────────────────────────
 
 pub fn save_blob(
     models_path: &str,

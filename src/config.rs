@@ -75,6 +75,11 @@ pub struct OllamaLibrary {
 
     /// Timeout for HTTP requests in seconds.
     pub timeout: f64,
+
+    /// Size in bytes for each chunk when downloading large blobs in parts.
+    /// Set to 0 to disable chunked downloading and download blobs in one stream.
+    /// Default is 134217728 (128 MiB).
+    pub chunk_size_bytes: u64,
 }
 
 impl Default for OllamaLibrary {
@@ -85,6 +90,7 @@ impl Default for OllamaLibrary {
             library_base_url: "https://ollama.com/library/".to_string(),
             verify_ssl: true,
             timeout: 120.0,
+            chunk_size_bytes: 134_217_728, // 128 MiB
         }
     }
 }
@@ -280,6 +286,16 @@ impl AppSettings {
             ollama_library.insert(
                 "timeout".to_string(),
                 Value::Number(serde_json::Number::from_f64(defaults.timeout).unwrap()),
+            );
+        }
+        if !ollama_library.contains_key("chunk_size_bytes") {
+            warn!(
+                "Missing field 'ollama_library.chunk_size_bytes', using default: {}",
+                defaults.chunk_size_bytes
+            );
+            ollama_library.insert(
+                "chunk_size_bytes".to_string(),
+                Value::Number(serde_json::Number::from(defaults.chunk_size_bytes)),
             );
         }
 

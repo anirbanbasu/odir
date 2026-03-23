@@ -109,11 +109,17 @@ impl HuggingFaceModelDownloader {
         named_digest: &str,
     ) -> Result<(PathBuf, String)> {
         let url = self.make_blob_url(model_repo, named_digest);
+        let blobs_dir = expand_models_path(&self.settings.ollama_library.models_path)
+            .ok()
+            .map(|p| p.join("blobs"));
+        let chunk_size = self.settings.ollama_library.chunk_size_bytes;
         download_model_blob(
             &self.client,
             &url,
             named_digest,
             &mut self.unnecessary_files,
+            chunk_size,
+            blobs_dir.as_deref(),
         )
     }
 

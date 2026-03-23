@@ -22,6 +22,13 @@ static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PENDING_SIGNAL: AtomicUsize = AtomicUsize::new(0);
 static CONFIRMATION_REQUIRED: AtomicBool = AtomicBool::new(false);
 static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+static KEEP_PARTIAL_DOWNLOADS: AtomicBool = AtomicBool::new(false);
+
+enum InterruptDecision {
+    ExitAndRemove,
+    ExitAndKeep,
+    Continue,
+}
 
 /// Check if an interrupt signal has been received
 pub fn is_interrupted() -> bool {
@@ -31,6 +38,11 @@ pub fn is_interrupted() -> bool {
 /// Set the interrupted flag
 pub fn set_interrupted() {
     INTERRUPTED.store(true, Ordering::Release);
+}
+
+/// Check whether completed chunk-download parts should be retained on interrupt.
+pub fn keep_partial_downloads() -> bool {
+    KEEP_PARTIAL_DOWNLOADS.load(Ordering::Acquire)
 }
 
 /// Enable or disable confirmation prompts for interrupts
@@ -70,11 +82,50 @@ pub fn confirm_pending_interrupt() -> bool {
         _ => "Interrupt",
     };
 
+    KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
     if prompt_for_interrupt_confirmation(label) {
         set_interrupted();
         true
     } else {
         false
+    }
+}
+
+/// Prompt the user to confirm interrupt for a pending signal while chunked
+/// downloading is active.
+///
+/// Returns true if the user confirms exit (either removing or keeping partial
+/// downloads), false if the user wants to continue.
+pub fn confirm_pending_interrupt_for_chunked(completed_parts: u64) -> bool {
+    if !CONFIRMATION_REQUIRED.load(Ordering::Acquire) {
+        return false;
+    }
+
+    if !INTERRUPT_REQUESTED.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+
+    let signal_id = PENDING_SIGNAL.swap(0, Ordering::AcqRel);
+    let label = match signal_id {
+        x if x == SIGTERM as usize => "Termination",
+        _ => "Interrupt",
+    };
+
+    match prompt_for_interrupt_confirmation_chunked(label, completed_parts) {
+        InterruptDecision::ExitAndRemove => {
+            KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
+            set_interrupted();
+            true
+        }
+        InterruptDecision::ExitAndKeep => {
+            KEEP_PARTIAL_DOWNLOADS.store(true, Ordering::Release);
+            set_interrupted();
+            true
+        }
+        InterruptDecision::Continue => {
+            KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
+            false
+        }
     }
 }
 
@@ -150,6 +201,100 @@ fn prompt_for_interrupt_confirmation(signal_name: &str) -> bool {
         } else {
             info!("Interrupt confirmation timed out; continuing");
             false
+        }
+    }
+}
+
+/// Prompt the user to confirm interrupt for chunked downloads.
+///
+/// `y` => exit and remove partial downloads
+/// `k` => exit and keep completed partial downloads
+/// `N`/timeout => continue downloading
+fn prompt_for_interrupt_confirmation_chunked(
+    signal_name: &str,
+    completed_parts: u64,
+) -> InterruptDecision {
+    eprint!(
+        "\n{}: All partially downloaded temporary files can be removed. Do you really want to exit? Enter k to keep {} partial downloads. [y/k/N] (timeout to N in 10 seconds): ",
+        signal_name, completed_parts
+    );
+    let _ = io::stderr().flush();
+
+    #[cfg(unix)]
+    {
+        let stdin = io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut fds = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        let timeout_ms = 10_000;
+        let poll_result = unsafe { libc::poll(&mut fds as *mut libc::pollfd, 1, timeout_ms) };
+        if poll_result > 0 && (fds.revents & libc::POLLIN) != 0 {
+            let mut input = String::new();
+            match stdin.read_line(&mut input) {
+                Ok(_) => {
+                    let response = input.trim().to_lowercase();
+                    if matches!(response.as_str(), "y" | "yes") {
+                        return InterruptDecision::ExitAndRemove;
+                    }
+                    if matches!(response.as_str(), "k" | "keep") {
+                        return InterruptDecision::ExitAndKeep;
+                    }
+                    return InterruptDecision::Continue;
+                }
+                Err(_) => {
+                    error!("Failed to read user input for interrupt confirmation");
+                    return InterruptDecision::Continue;
+                }
+            }
+        }
+
+        if poll_result == 0 {
+            info!("Interrupt confirmation timed out; continuing");
+            return InterruptDecision::Continue;
+        }
+
+        error!("Failed to poll stdin for interrupt confirmation");
+        InterruptDecision::Continue
+    }
+
+    #[cfg(not(unix))]
+    {
+        if event::poll(Duration::from_secs(10)).unwrap_or(false) {
+            let mut input = String::new();
+            loop {
+                match event::read() {
+                    Ok(event::Event::Key(key_event)) => match key_event.code {
+                        event::KeyCode::Char(c) => {
+                            input.push(c);
+                        }
+                        event::KeyCode::Enter => {
+                            let response = input.trim().to_lowercase();
+                            if matches!(response.as_str(), "y" | "yes") {
+                                return InterruptDecision::ExitAndRemove;
+                            }
+                            if matches!(response.as_str(), "k" | "keep") {
+                                return InterruptDecision::ExitAndKeep;
+                            }
+                            return InterruptDecision::Continue;
+                        }
+                        event::KeyCode::Esc => {
+                            return InterruptDecision::Continue;
+                        }
+                        _ => {}
+                    },
+                    Err(_) => {
+                        error!("Failed to read user input for interrupt confirmation");
+                        return InterruptDecision::Continue;
+                    }
+                }
+            }
+        } else {
+            info!("Interrupt confirmation timed out; continuing");
+            InterruptDecision::Continue
         }
     }
 }
@@ -274,6 +419,7 @@ mod tests {
         PENDING_SIGNAL.store(0, Ordering::SeqCst);
         CONFIRMATION_REQUIRED.store(false, Ordering::SeqCst);
         CLEANUP_DONE.store(false, Ordering::SeqCst);
+        KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::SeqCst);
     }
 
     #[test]
