@@ -23,7 +23,7 @@ pub enum HttpUrlParseError {
 
     /// chunk_size_mib is not one of the allowed values.
     #[error("chunk_size_mib must be one of [0, 32, 64, 128, 256, 512], got: {0}")]
-    InvalidChunkSizeMb(u64),
+    InvalidChunkSizeMiB(u64),
 }
 
 pub fn validate_string_as_http_url(url_str: &str) -> Result<Url, HttpUrlParseError> {
@@ -127,7 +127,7 @@ impl AppSettings {
         validate_string_as_http_url(&self.ollama_library.library_base_url)?;
         const VALID_CHUNK_SIZES_MB: &[u64] = &[0, 32, 64, 128, 256, 512];
         if !VALID_CHUNK_SIZES_MB.contains(&self.ollama_library.chunk_size_mib) {
-            return Err(HttpUrlParseError::InvalidChunkSizeMb(
+            return Err(HttpUrlParseError::InvalidChunkSizeMiB(
                 self.ollama_library.chunk_size_mib,
             ));
         }

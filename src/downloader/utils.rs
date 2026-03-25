@@ -744,10 +744,57 @@ fn persist_chunked_state(
     models_dir_ownership: Option<Ownership>,
 ) -> Result<()> {
     let temp_path = state_file.with_extension("state.tmp");
+    let backup_path = state_file.with_extension("state.bak");
     let payload = serde_json::to_vec_pretty(state)
         .map_err(|e| DownloaderError::Other(format!("Failed to serialize chunk state: {}", e)))?;
     fs::write(&temp_path, payload)?;
-    fs::rename(&temp_path, state_file)?;
+
+    let had_existing_state = state_file.exists();
+    if had_existing_state {
+        if backup_path.exists()
+            && let Err(e) = fs::remove_file(&backup_path)
+        {
+            let _ = fs::remove_file(&temp_path);
+            return Err(DownloaderError::Other(format!(
+                "Failed to remove stale chunk state backup '{}': {}",
+                backup_path.display(),
+                e
+            )));
+        }
+
+        fs::rename(state_file, &backup_path).map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            DownloaderError::Other(format!(
+                "Failed to backup existing chunk state file '{}': {}",
+                state_file.display(),
+                e
+            ))
+        })?;
+    }
+
+    if let Err(e) = fs::rename(&temp_path, state_file) {
+        let mut restore_message = String::new();
+        if had_existing_state && let Err(restore_err) = fs::rename(&backup_path, state_file) {
+            restore_message = format!(
+                "; additionally failed to restore previous state from '{}' to '{}': {}",
+                backup_path.display(),
+                state_file.display(),
+                restore_err
+            );
+        }
+        let _ = fs::remove_file(&temp_path);
+        return Err(DownloaderError::Other(format!(
+            "Failed to persist chunk state to '{}': {}{}",
+            state_file.display(),
+            e,
+            restore_message
+        )));
+    }
+
+    if had_existing_state {
+        let _ = fs::remove_file(&backup_path);
+    }
+
     if let Some(ownership) = models_dir_ownership {
         ensure_ownership(state_file, ownership);
     }

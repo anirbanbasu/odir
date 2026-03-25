@@ -13,7 +13,10 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 #[cfg(not(unix))]
-use {crossterm::event, std::time::Duration};
+use {
+    crossterm::event,
+    std::time::{Duration, Instant},
+};
 
 /// Flag that indicates if the application has been interrupted
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -178,32 +181,42 @@ fn prompt_for_interrupt_confirmation(signal_name: &str) -> bool {
 
     #[cfg(not(unix))]
     {
-        if event::poll(Duration::from_secs(10)).unwrap_or(false) {
-            let mut input = String::new();
-            loop {
-                match event::read() {
-                    Ok(event::Event::Key(key_event)) => match key_event.code {
-                        event::KeyCode::Char(c) => {
-                            input.push(c);
-                        }
-                        event::KeyCode::Enter => {
-                            let response = input.trim().to_lowercase();
-                            return matches!(response.as_str(), "y" | "yes");
-                        }
-                        event::KeyCode::Esc => {
-                            return false;
-                        }
-                        _ => {}
-                    },
-                    Err(_) => {
-                        error!("Failed to read user input for interrupt confirmation");
+        let timeout = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut input = String::new();
+
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                info!("Interrupt confirmation timed out; continuing");
+                return false;
+            }
+
+            let remaining = timeout.saturating_sub(elapsed);
+            if !event::poll(remaining).unwrap_or(false) {
+                info!("Interrupt confirmation timed out; continuing");
+                return false;
+            }
+
+            match event::read() {
+                Ok(event::Event::Key(key_event)) => match key_event.code {
+                    event::KeyCode::Char(c) => {
+                        input.push(c);
+                    }
+                    event::KeyCode::Enter => {
+                        let response = input.trim().to_lowercase();
+                        return matches!(response.as_str(), "y" | "yes");
+                    }
+                    event::KeyCode::Esc => {
                         return false;
                     }
+                    _ => {}
+                },
+                Err(_) => {
+                    error!("Failed to read user input for interrupt confirmation");
+                    return false;
                 }
             }
-        } else {
-            info!("Interrupt confirmation timed out; continuing");
-            false
         }
     }
 }
@@ -251,31 +264,41 @@ fn read_chunked_interrupt_decision_unix() -> InterruptDecision {
 
 #[cfg(not(unix))]
 fn read_chunked_interrupt_decision_non_unix() -> InterruptDecision {
-    if event::poll(Duration::from_secs(10)).unwrap_or(false) {
-        let mut input = String::new();
-        loop {
-            match event::read() {
-                Ok(event::Event::Key(key_event)) => match key_event.code {
-                    event::KeyCode::Char(c) => {
-                        input.push(c);
-                    }
-                    event::KeyCode::Enter => {
-                        return parse_chunked_interrupt_decision(&input);
-                    }
-                    event::KeyCode::Esc => {
-                        return InterruptDecision::Continue;
-                    }
-                    _ => {}
-                },
-                Err(_) => {
-                    error!("Failed to read user input for interrupt confirmation");
+    let timeout = Duration::from_secs(10);
+    let start = Instant::now();
+    let mut input = String::new();
+
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            info!("Interrupt confirmation timed out; continuing");
+            return InterruptDecision::Continue;
+        }
+
+        let remaining = timeout.saturating_sub(elapsed);
+        if !event::poll(remaining).unwrap_or(false) {
+            info!("Interrupt confirmation timed out; continuing");
+            return InterruptDecision::Continue;
+        }
+
+        match event::read() {
+            Ok(event::Event::Key(key_event)) => match key_event.code {
+                event::KeyCode::Char(c) => {
+                    input.push(c);
+                }
+                event::KeyCode::Enter => {
+                    return parse_chunked_interrupt_decision(&input);
+                }
+                event::KeyCode::Esc => {
                     return InterruptDecision::Continue;
                 }
+                _ => {}
+            },
+            Err(_) => {
+                error!("Failed to read user input for interrupt confirmation");
+                return InterruptDecision::Continue;
             }
         }
-    } else {
-        info!("Interrupt confirmation timed out; continuing");
-        InterruptDecision::Continue
     }
 }
 
