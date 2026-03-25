@@ -91,7 +91,7 @@ impl OllamaModelDownloader {
     }
 
     /// Download a model blob with progress tracking
-    fn download_model_blob(
+    fn download_blob_for_model(
         &mut self,
         model: &str,
         named_digest: &str,
@@ -113,7 +113,7 @@ impl OllamaModelDownloader {
     }
 
     /// Save the blob to the models directory
-    fn save_blob(
+    fn persist_blob(
         &mut self,
         source: &Path,
         named_digest: &str,
@@ -207,7 +207,7 @@ impl ModelDownloader for OllamaModelDownloader {
         // Download model configuration BLOB
         info!("Downloading model configuration {}", manifest.config.digest);
         let (file_model_config, digest_model_config) =
-            match self_mut.download_model_blob(&model, &manifest.config.digest) {
+            match self_mut.download_blob_for_model(&model, &manifest.config.digest) {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Failed to download model configuration: {}", e);
@@ -247,7 +247,7 @@ impl ModelDownloader for OllamaModelDownloader {
 
                 info!("Downloading {} layer {}", layer.media_type, layer.digest);
                 let (file_layer, digest_layer) =
-                    match self_mut.download_model_blob(&model, &layer.digest) {
+                    match self_mut.download_blob_for_model(&model, &layer.digest) {
                         Ok(result) => result,
                         Err(e) => {
                             error!("Failed to download layer {}: {}", layer.digest, e);
@@ -261,7 +261,7 @@ impl ModelDownloader for OllamaModelDownloader {
 
         // All BLOBs downloaded, now save them
         for (source, named_digest, computed_digest) in files_to_be_copied {
-            match self_mut.save_blob(&source, &named_digest, &computed_digest) {
+            match self_mut.persist_blob(&source, &named_digest, &computed_digest) {
                 Ok(_) => {
                     // Cleanup source file
                     let _ = fs::remove_file(&source);
