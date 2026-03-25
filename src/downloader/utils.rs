@@ -889,6 +889,78 @@ fn update_chunk_progress(
     ));
 }
 
+struct CoordinatorLoopParams<'a> {
+    done_rx: &'a mpsc::Receiver<u64>,
+    cancel: &'a AtomicBool,
+    first_error: &'a Mutex<Option<DownloaderError>>,
+    bytes_done: &'a AtomicU64,
+    parts_done: &'a AtomicU64,
+    pb: &'a ProgressBar,
+    named_digest: &'a str,
+    num_parts: u64,
+    models_dir_ownership: Option<Ownership>,
+    state: &'a mut ChunkedState,
+    workspace: &'a ChunkedWorkspace,
+    missing_parts_count: usize,
+    already_downloaded: u64,
+}
+
+/// Runs the coordinator loop, polling the done channel, persisting state,
+/// and updating progress until all parts finish or the user aborts.
+/// Returns `(user_aborted, finished_missing)`.
+fn run_coordinator_loop(p: CoordinatorLoopParams<'_>) -> (bool, usize) {
+    let mut user_aborted = false;
+    let mut finished_missing = 0usize;
+    let mut last_bytes_done = p.already_downloaded;
+    let mut refresh_interval = Duration::from_millis(CHUNKED_REFRESH_IDLE_MS);
+
+    while finished_missing < p.missing_parts_count {
+        if check_chunk_interrupt(p.cancel, p.pb, p.parts_done) {
+            user_aborted = true;
+            break;
+        }
+
+        if p.first_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            p.cancel.store(true, Ordering::Release);
+            break;
+        }
+
+        match p.done_rx.recv_timeout(refresh_interval) {
+            Ok(part_idx) => {
+                if on_chunk_completed(
+                    part_idx,
+                    p.state,
+                    p.workspace,
+                    p.models_dir_ownership,
+                    p.cancel,
+                    p.first_error,
+                    &mut finished_missing,
+                ) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        update_chunk_progress(
+            p.pb,
+            p.bytes_done,
+            p.parts_done,
+            p.named_digest,
+            p.num_parts,
+            &mut last_bytes_done,
+            &mut refresh_interval,
+        );
+    }
+
+    (user_aborted, finished_missing)
+}
+
 fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) -> Result<bool> {
     let DownloadChunksParallelRequest {
         client,
@@ -926,8 +998,6 @@ fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) 
 
     let mut user_aborted = false;
     let mut finished_missing: usize = 0;
-    let mut last_bytes_done = already_downloaded;
-    let mut refresh_interval = Duration::from_millis(CHUNKED_REFRESH_IDLE_MS);
 
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -951,49 +1021,21 @@ fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) 
 
         drop(done_tx);
 
-        while finished_missing < missing_parts.len() {
-            if check_chunk_interrupt(&cancel, pb, &parts_done) {
-                user_aborted = true;
-                break;
-            }
-
-            if first_error
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
-            {
-                cancel.store(true, Ordering::Release);
-                break;
-            }
-
-            match done_rx.recv_timeout(refresh_interval) {
-                Ok(part_idx) => {
-                    if on_chunk_completed(
-                        part_idx,
-                        state,
-                        workspace,
-                        models_dir_ownership,
-                        &cancel,
-                        &first_error,
-                        &mut finished_missing,
-                    ) {
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-
-            update_chunk_progress(
-                pb,
-                &bytes_done,
-                &parts_done,
-                named_digest,
-                num_parts,
-                &mut last_bytes_done,
-                &mut refresh_interval,
-            );
-        }
+        (user_aborted, finished_missing) = run_coordinator_loop(CoordinatorLoopParams {
+            done_rx: &done_rx,
+            cancel: &cancel,
+            first_error: &first_error,
+            bytes_done: &bytes_done,
+            parts_done: &parts_done,
+            pb,
+            named_digest,
+            num_parts,
+            models_dir_ownership,
+            state,
+            workspace,
+            missing_parts_count: missing_parts.len(),
+            already_downloaded,
+        });
 
         cancel.store(true, Ordering::Release);
     });
