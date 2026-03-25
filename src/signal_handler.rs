@@ -208,6 +208,77 @@ fn prompt_for_interrupt_confirmation(signal_name: &str) -> bool {
     }
 }
 
+fn parse_chunked_interrupt_decision(input: &str) -> InterruptDecision {
+    let response = input.trim().to_lowercase();
+    if matches!(response.as_str(), "y" | "yes") {
+        InterruptDecision::ExitAndRemove
+    } else if matches!(response.as_str(), "k" | "keep") {
+        InterruptDecision::ExitAndKeep
+    } else {
+        InterruptDecision::Continue
+    }
+}
+
+#[cfg(unix)]
+fn read_chunked_interrupt_decision_unix() -> InterruptDecision {
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    let mut fds = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    let timeout_ms = 10_000;
+    let poll_result = unsafe { libc::poll(&mut fds as *mut libc::pollfd, 1, timeout_ms) };
+    if poll_result > 0 && (fds.revents & libc::POLLIN) != 0 {
+        let mut input = String::new();
+        match stdin.read_line(&mut input) {
+            Ok(_) => parse_chunked_interrupt_decision(&input),
+            Err(_) => {
+                error!("Failed to read user input for interrupt confirmation");
+                InterruptDecision::Continue
+            }
+        }
+    } else if poll_result == 0 {
+        info!("Interrupt confirmation timed out; continuing");
+        InterruptDecision::Continue
+    } else {
+        error!("Failed to poll stdin for interrupt confirmation");
+        InterruptDecision::Continue
+    }
+}
+
+#[cfg(not(unix))]
+fn read_chunked_interrupt_decision_non_unix() -> InterruptDecision {
+    if event::poll(Duration::from_secs(10)).unwrap_or(false) {
+        let mut input = String::new();
+        loop {
+            match event::read() {
+                Ok(event::Event::Key(key_event)) => match key_event.code {
+                    event::KeyCode::Char(c) => {
+                        input.push(c);
+                    }
+                    event::KeyCode::Enter => {
+                        return parse_chunked_interrupt_decision(&input);
+                    }
+                    event::KeyCode::Esc => {
+                        return InterruptDecision::Continue;
+                    }
+                    _ => {}
+                },
+                Err(_) => {
+                    error!("Failed to read user input for interrupt confirmation");
+                    return InterruptDecision::Continue;
+                }
+            }
+        }
+    } else {
+        info!("Interrupt confirmation timed out; continuing");
+        InterruptDecision::Continue
+    }
+}
+
 /// Prompt the user to confirm interrupt for chunked downloads.
 ///
 /// `y` => exit and remove partial downloads
@@ -225,80 +296,12 @@ fn prompt_for_interrupt_confirmation_chunked(
 
     #[cfg(unix)]
     {
-        let stdin = io::stdin();
-        let fd = stdin.as_raw_fd();
-        let mut fds = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-
-        let timeout_ms = 10_000;
-        let poll_result = unsafe { libc::poll(&mut fds as *mut libc::pollfd, 1, timeout_ms) };
-        if poll_result > 0 && (fds.revents & libc::POLLIN) != 0 {
-            let mut input = String::new();
-            match stdin.read_line(&mut input) {
-                Ok(_) => {
-                    let response = input.trim().to_lowercase();
-                    if matches!(response.as_str(), "y" | "yes") {
-                        return InterruptDecision::ExitAndRemove;
-                    }
-                    if matches!(response.as_str(), "k" | "keep") {
-                        return InterruptDecision::ExitAndKeep;
-                    }
-                    return InterruptDecision::Continue;
-                }
-                Err(_) => {
-                    error!("Failed to read user input for interrupt confirmation");
-                    return InterruptDecision::Continue;
-                }
-            }
-        }
-
-        if poll_result == 0 {
-            info!("Interrupt confirmation timed out; continuing");
-            return InterruptDecision::Continue;
-        }
-
-        error!("Failed to poll stdin for interrupt confirmation");
-        InterruptDecision::Continue
+        read_chunked_interrupt_decision_unix()
     }
 
     #[cfg(not(unix))]
     {
-        if event::poll(Duration::from_secs(10)).unwrap_or(false) {
-            let mut input = String::new();
-            loop {
-                match event::read() {
-                    Ok(event::Event::Key(key_event)) => match key_event.code {
-                        event::KeyCode::Char(c) => {
-                            input.push(c);
-                        }
-                        event::KeyCode::Enter => {
-                            let response = input.trim().to_lowercase();
-                            if matches!(response.as_str(), "y" | "yes") {
-                                return InterruptDecision::ExitAndRemove;
-                            }
-                            if matches!(response.as_str(), "k" | "keep") {
-                                return InterruptDecision::ExitAndKeep;
-                            }
-                            return InterruptDecision::Continue;
-                        }
-                        event::KeyCode::Esc => {
-                            return InterruptDecision::Continue;
-                        }
-                        _ => {}
-                    },
-                    Err(_) => {
-                        error!("Failed to read user input for interrupt confirmation");
-                        return InterruptDecision::Continue;
-                    }
-                }
-            }
-        } else {
-            info!("Interrupt confirmation timed out; continuing");
-            InterruptDecision::Continue
-        }
+        read_chunked_interrupt_decision_non_unix()
     }
 }
 
