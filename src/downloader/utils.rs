@@ -817,6 +817,78 @@ struct DownloadChunksParallelRequest<'a> {
     download_chunks_in_parallel: bool,
 }
 
+/// Checks signal-handler interrupt flags and, if warranted, prompts the user.
+/// Stores `true` into `cancel` and returns `true` when the coordinator should abort.
+fn check_chunk_interrupt(cancel: &AtomicBool, pb: &ProgressBar, parts_done: &AtomicU64) -> bool {
+    if crate::signal_handler::is_interrupted() {
+        cancel.store(true, Ordering::Release);
+        return true;
+    }
+    if crate::signal_handler::interrupt_requested() {
+        let should_exit = pb.suspend(|| {
+            crate::signal_handler::confirm_pending_interrupt_for_chunked(
+                parts_done.load(Ordering::Acquire),
+            )
+        });
+        if should_exit {
+            cancel.store(true, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+/// Marks `part_idx` as completed, persists sidecar state, and increments `finished_missing`.
+/// Returns `true` when the coordinator loop should break (state persistence failed).
+fn on_chunk_completed(
+    part_idx: u64,
+    state: &mut ChunkedState,
+    workspace: &ChunkedWorkspace,
+    models_dir_ownership: Option<Ownership>,
+    cancel: &AtomicBool,
+    first_error: &Mutex<Option<DownloaderError>>,
+    finished_missing: &mut usize,
+) -> bool {
+    *finished_missing += 1;
+    let idx = part_idx as usize;
+    if idx < state.completed.len() {
+        state.completed[idx] = true;
+        if let Err(e) = persist_chunked_state(&workspace.state_file, state, models_dir_ownership) {
+            *first_error.lock().unwrap_or_else(|pe| pe.into_inner()) = Some(e);
+            cancel.store(true, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+/// Updates the adaptive refresh interval and repaints the progress bar.
+fn update_chunk_progress(
+    pb: &ProgressBar,
+    bytes_done: &AtomicU64,
+    parts_done: &AtomicU64,
+    named_digest: &str,
+    num_parts: u64,
+    last_bytes_done: &mut u64,
+    refresh_interval: &mut Duration,
+) {
+    let current = bytes_done.load(Ordering::Acquire);
+    let delta = current.saturating_sub(*last_bytes_done);
+    *refresh_interval = if delta > 0 {
+        Duration::from_millis(CHUNKED_REFRESH_ACTIVE_MS)
+    } else {
+        Duration::from_millis(CHUNKED_REFRESH_IDLE_MS)
+    };
+    *last_bytes_done = current;
+    pb.set_position(current);
+    pb.set_message(format!(
+        "Downloading BLOB {} part {}/{}",
+        named_digest,
+        (parts_done.load(Ordering::Acquire) + 1).min(num_parts),
+        num_parts
+    ));
+}
+
 fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) -> Result<bool> {
     let DownloadChunksParallelRequest {
         client,
@@ -880,23 +952,9 @@ fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) 
         drop(done_tx);
 
         while finished_missing < missing_parts.len() {
-            if crate::signal_handler::is_interrupted() {
+            if check_chunk_interrupt(&cancel, pb, &parts_done) {
                 user_aborted = true;
-                cancel.store(true, Ordering::Release);
                 break;
-            }
-
-            if crate::signal_handler::interrupt_requested() {
-                let should_exit = pb.suspend(|| {
-                    crate::signal_handler::confirm_pending_interrupt_for_chunked(
-                        parts_done.load(Ordering::Acquire),
-                    )
-                });
-                if should_exit {
-                    user_aborted = true;
-                    cancel.store(true, Ordering::Release);
-                    break;
-                }
             }
 
             if first_error
@@ -910,41 +968,31 @@ fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) 
 
             match done_rx.recv_timeout(refresh_interval) {
                 Ok(part_idx) => {
-                    finished_missing += 1;
-                    let idx = part_idx as usize;
-                    if idx < state.completed.len() {
-                        state.completed[idx] = true;
-                        if let Err(e) = persist_chunked_state(
-                            &workspace.state_file,
-                            state,
-                            models_dir_ownership,
-                        ) {
-                            *first_error.lock().unwrap_or_else(|pe| pe.into_inner()) = Some(e);
-                            cancel.store(true, Ordering::Release);
-                            break;
-                        }
+                    if on_chunk_completed(
+                        part_idx,
+                        state,
+                        workspace,
+                        models_dir_ownership,
+                        &cancel,
+                        &first_error,
+                        &mut finished_missing,
+                    ) {
+                        break;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            let current_bytes_done = bytes_done.load(Ordering::Acquire);
-            let bytes_delta = current_bytes_done.saturating_sub(last_bytes_done);
-            refresh_interval = if bytes_delta > 0 {
-                Duration::from_millis(CHUNKED_REFRESH_ACTIVE_MS)
-            } else {
-                Duration::from_millis(CHUNKED_REFRESH_IDLE_MS)
-            };
-            last_bytes_done = current_bytes_done;
-
-            pb.set_position(current_bytes_done);
-            pb.set_message(format!(
-                "Downloading BLOB {} part {}/{}",
+            update_chunk_progress(
+                pb,
+                &bytes_done,
+                &parts_done,
                 named_digest,
-                (parts_done.load(Ordering::Acquire) + 1).min(num_parts),
-                num_parts
-            ));
+                num_parts,
+                &mut last_bytes_done,
+                &mut refresh_interval,
+            );
         }
 
         cancel.store(true, Ordering::Release);
