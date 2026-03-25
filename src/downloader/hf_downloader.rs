@@ -3,9 +3,9 @@ use crate::config::AppSettings;
 use crate::downloader::manifest::ImageManifest;
 use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};
 use crate::downloader::utils::{
-    Ownership, cleanup_unnecessary_files, download_model_blob, expand_models_path,
-    infer_models_dir_ownership, is_model_present_in_ollama, save_blob, save_manifest,
-    warn_if_models_path_requires_root,
+    BlobDownloadRequest, Ownership, cleanup_unnecessary_files, download_model_blob,
+    expand_models_path, infer_models_dir_ownership, is_model_present_in_ollama, save_blob,
+    save_manifest, warn_if_models_path_requires_root,
 };
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
@@ -112,16 +112,17 @@ impl HuggingFaceModelDownloader {
         let blobs_dir = expand_models_path(&self.settings.ollama_library.models_path)
             .ok()
             .map(|p| p.join("blobs"));
-        let chunk_size = self.settings.ollama_library.chunk_size_mb * 1024 * 1024;
-        download_model_blob(
-            &self.client,
-            &url,
+        let chunk_size = self.settings.ollama_library.chunk_size_mib * 1024 * 1024;
+        download_model_blob(BlobDownloadRequest {
+            client: &self.client,
+            url: &url,
             named_digest,
-            &mut self.unnecessary_files,
-            chunk_size,
-            blobs_dir.as_deref(),
-            self.models_dir_ownership,
-        )
+            unnecessary_files: &mut self.unnecessary_files,
+            chunk_size_bytes: chunk_size,
+            blobs_dir: blobs_dir.as_deref(),
+            models_dir_ownership: self.models_dir_ownership,
+            download_chunks_in_parallel: self.settings.ollama_library.download_chunks_in_parallel,
+        })
     }
 
     /// Save the blob to the models directory

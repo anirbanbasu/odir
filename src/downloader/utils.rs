@@ -6,14 +6,19 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 /// Check if a model is present in the Ollama server.
@@ -161,15 +166,29 @@ fn is_running_as_root() -> bool {
     }
 }
 
-pub fn download_model_blob(
-    client: &Client,
-    url: &str,
-    named_digest: &str,
-    unnecessary_files: &mut HashSet<PathBuf>,
-    chunk_size_bytes: u64,
-    blobs_dir: Option<&Path>,
-    models_dir_ownership: Option<Ownership>,
-) -> Result<(PathBuf, String)> {
+pub struct BlobDownloadRequest<'a> {
+    pub client: &'a Client,
+    pub url: &'a str,
+    pub named_digest: &'a str,
+    pub unnecessary_files: &'a mut HashSet<PathBuf>,
+    pub chunk_size_bytes: u64,
+    pub blobs_dir: Option<&'a Path>,
+    pub models_dir_ownership: Option<Ownership>,
+    pub download_chunks_in_parallel: bool,
+}
+
+pub fn download_model_blob(request: BlobDownloadRequest<'_>) -> Result<(PathBuf, String)> {
+    let BlobDownloadRequest {
+        client,
+        url,
+        named_digest,
+        unnecessary_files,
+        chunk_size_bytes,
+        blobs_dir,
+        models_dir_ownership,
+        download_chunks_in_parallel,
+    } = request;
+
     ensure_download_not_interrupted()?;
 
     if let Some(result) = try_download_model_blob_chunked(ChunkedBlobProbe {
@@ -180,6 +199,7 @@ pub fn download_model_blob(
         chunk_size_bytes,
         blobs_dir,
         models_dir_ownership,
+        download_chunks_in_parallel,
     }) {
         return result;
     }
@@ -212,6 +232,7 @@ struct ChunkedBlobProbe<'a> {
     chunk_size_bytes: u64,
     blobs_dir: Option<&'a Path>,
     models_dir_ownership: Option<Ownership>,
+    download_chunks_in_parallel: bool,
 }
 
 fn try_download_model_blob_chunked(
@@ -225,6 +246,7 @@ fn try_download_model_blob_chunked(
         chunk_size_bytes,
         blobs_dir,
         models_dir_ownership,
+        download_chunks_in_parallel,
     } = request;
 
     if chunk_size_bytes == 0 {
@@ -293,6 +315,7 @@ fn try_download_model_blob_chunked(
             blobs_dir,
             total_size,
             models_dir_ownership,
+            download_chunks_in_parallel,
         }));
     }
 
@@ -362,7 +385,7 @@ fn download_model_blob_single_stream(
     let _progress_guard = ProgressGuard;
 
     let mut response_reader = response;
-    let mut buffer = [0u8; 8192];
+    let mut buffer = vec![0u8; STREAM_IO_BUFFER_SIZE];
 
     loop {
         check_single_stream_interrupt(&pb)?;
@@ -479,17 +502,30 @@ fn probe_byte_range_support(client: &Client, url: &str, named_digest: &str) -> (
 
 // ─── Chunked / resumable download helpers ────────────────────────────────────
 
-/// Returns the directory that holds in-progress parts for a specific blob.
-/// Layout: `{blobs_dir}/.parts/{named_digest_as_fs_name}/`
-fn get_parts_dir(blobs_dir: &Path, named_digest: &str) -> PathBuf {
-    blobs_dir
-        .join(".parts")
-        .join(named_digest.replace(':', "-"))
+const CHUNKED_STATE_VERSION: u32 = 1;
+const MAX_PARALLEL_CHUNK_WORKERS: usize = 4;
+const CHUNKED_REFRESH_IDLE_MS: u64 = 100;
+const CHUNKED_REFRESH_ACTIVE_MS: u64 = 30;
+const STREAM_IO_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const CHUNK_IO_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const HASH_IO_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+fn digest_fs_name(named_digest: &str) -> String {
+    named_digest.replace(':', "-")
 }
 
-/// Zero-padded part filename, e.g. `part_00000003`.
-fn part_file_name(index: u64) -> String {
-    format!("part_{:08}", index)
+#[derive(Debug)]
+struct ChunkedWorkspace {
+    data_file: PathBuf,
+    state_file: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChunkedState {
+    version: u32,
+    total_size: u64,
+    chunk_size: u64,
+    completed: Vec<bool>,
 }
 
 /// Expected byte count for part `part_idx` out of `num_parts` total.
@@ -502,13 +538,6 @@ fn expected_part_size(part_idx: u64, num_parts: u64, total_size: u64, chunk_size
     }
 }
 
-/// Returns `true` when the part file exists and has exactly the expected byte count.
-fn is_part_complete(part_path: &Path, expected_size: u64) -> bool {
-    fs::metadata(part_path)
-        .map(|m| m.len() == expected_size)
-        .unwrap_or(false)
-}
-
 struct ChunkedBlobDownload<'a> {
     client: &'a Client,
     url: &'a str,
@@ -518,15 +547,15 @@ struct ChunkedBlobDownload<'a> {
     blobs_dir: &'a Path,
     total_size: u64,
     models_dir_ownership: Option<Ownership>,
+    download_chunks_in_parallel: bool,
 }
 
 /// Download a blob by fetching it in sequential byte-range parts and assembling
-/// them into a single file.
+/// them directly into a single preallocated file.
 ///
 /// * **User abort without chunk removal** – parts directory is retained; subsequent call can resume from where it left off.
 /// * **User abort with chunk removal** – the entire parts directory is wiped; callers get a clean slate.
-/// * **Network error** – only the incomplete current-part file is removed; already
-///   downloaded parts are kept so a subsequent call can resume from where it left off.
+/// * **Network error** – completed chunk map is retained and incomplete chunks are re-fetched on next run.
 fn download_model_blob_chunked(request: ChunkedBlobDownload<'_>) -> Result<(PathBuf, String)> {
     let ChunkedBlobDownload {
         client,
@@ -537,14 +566,21 @@ fn download_model_blob_chunked(request: ChunkedBlobDownload<'_>) -> Result<(Path
         blobs_dir,
         total_size,
         models_dir_ownership,
+        download_chunks_in_parallel,
     } = request;
 
     let num_parts = total_size.div_ceil(chunk_size);
-    let parts_dir = get_parts_dir(blobs_dir, named_digest);
+    let workspace = ensure_chunked_workspace(blobs_dir, named_digest, models_dir_ownership)?;
 
-    ensure_parts_directory(&parts_dir, blobs_dir, models_dir_ownership)?;
+    let mut state = load_or_initialize_chunked_state(
+        &workspace,
+        total_size,
+        chunk_size,
+        num_parts,
+        models_dir_ownership,
+    )?;
 
-    let scan = scan_chunked_parts(&parts_dir, num_parts, total_size, chunk_size);
+    let scan = scan_chunk_state(&state, num_parts, total_size, chunk_size);
     log_scan_summary(named_digest, num_parts, &scan);
 
     // Progress bar covering the full file, pre-advanced for already-downloaded bytes.
@@ -557,7 +593,9 @@ fn download_model_blob_chunked(request: ChunkedBlobDownload<'_>) -> Result<(Path
     );
     pb.set_message(format!(
         "Downloading BLOB {} part {}/{}",
-        named_digest, scan.completed_parts, num_parts
+        named_digest,
+        (scan.completed_parts + 1).min(num_parts),
+        num_parts
     ));
     pb.set_position(scan.already_downloaded);
 
@@ -570,50 +608,54 @@ fn download_model_blob_chunked(request: ChunkedBlobDownload<'_>) -> Result<(Path
     crate::signal_handler::set_progress_active(true);
     let _progress_guard = ProgressGuard;
 
-    let mut completed_parts = scan.completed_parts;
-    download_missing_parts(DownloadMissingPartsRequest {
+    let user_aborted = download_missing_chunks_parallel(DownloadChunksParallelRequest {
         client,
         url,
         named_digest,
-        parts_dir: &parts_dir,
+        workspace: &workspace,
         missing_parts: &scan.missing_parts,
+        state: &mut state,
         num_parts,
         chunk_size,
         total_size,
-        completed_parts: &mut completed_parts,
+        already_downloaded: scan.already_downloaded,
+        completed_parts: scan.completed_parts,
         pb: &pb,
         models_dir_ownership,
+        download_chunks_in_parallel,
     })?;
 
-    pb.finish_with_message("Downloaded (assembling parts)");
+    if user_aborted {
+        pb.abandon();
+        if !crate::signal_handler::keep_partial_downloads() {
+            cleanup_chunk_workspace(&workspace);
+        }
+        return Err(DownloaderError::Other(
+            "Download interrupted by user".to_string(),
+        ));
+    }
 
-    // Assemble all parts into a NamedTempFile while computing SHA-256.
-    let (mut hasher, mut temp_file) = create_assembly_targets()?;
-    let temp_path = temp_file.path().to_path_buf();
-    unnecessary_files.insert(temp_path.clone());
+    pb.finish_with_message("Downloaded");
 
-    assemble_parts_into_file(
-        &parts_dir,
-        num_parts,
-        named_digest,
-        &mut hasher,
-        &mut temp_file,
-    )?;
-
-    let computed_digest = format!("{:x}", hasher.finalize());
+    let computed_digest = compute_file_sha256(&workspace.data_file, named_digest)?;
     debug!(
-        "Assembled {} into {:?}, digest: {}",
-        named_digest, temp_path, computed_digest
+        "Downloaded {} to {:?}, digest: {}",
+        named_digest, workspace.data_file, computed_digest
     );
 
-    remove_parts_directory_after_success(&parts_dir);
+    // State file is no longer needed after success.
+    if let Err(e) = fs::remove_file(&workspace.state_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove chunk state file {:?}: {}",
+            workspace.state_file, e
+        );
+    }
 
-    let persisted_path = temp_file.into_temp_path();
-    let final_path = persisted_path
-        .keep()
-        .map_err(|e| DownloaderError::Other(format!("Failed to persist temp file: {}", e)))?;
+    unnecessary_files.insert(workspace.data_file.clone());
 
-    Ok((final_path, computed_digest))
+    Ok((workspace.data_file, computed_digest))
 }
 
 struct ChunkedPartScan {
@@ -622,25 +664,98 @@ struct ChunkedPartScan {
     missing_parts: Vec<u64>,
 }
 
-fn ensure_parts_directory(
-    parts_dir: &Path,
+fn ensure_chunked_workspace(
     blobs_dir: &Path,
+    named_digest: &str,
     models_dir_ownership: Option<Ownership>,
-) -> Result<()> {
-    if parts_dir.exists() {
-        return Ok(());
+) -> Result<ChunkedWorkspace> {
+    let parts_root = blobs_dir.join(".parts");
+    if !parts_root.exists() {
+        fs::create_dir_all(&parts_root)?;
+        info!("Created parts directory: {:?}", parts_root);
+    }
+    if let Some(ownership) = models_dir_ownership {
+        ensure_ownership_for_dir_tree(blobs_dir, &parts_root, ownership);
     }
 
-    fs::create_dir_all(parts_dir)?;
-    if let Some(ownership) = models_dir_ownership {
-        ensure_ownership_for_dir_tree(blobs_dir, parts_dir, ownership);
+    let stem = digest_fs_name(named_digest);
+    let data_file = parts_root.join(format!("{}.bin", stem));
+    let state_file = parts_root.join(format!("{}.state.json", stem));
+
+    Ok(ChunkedWorkspace {
+        data_file,
+        state_file,
+    })
+}
+
+fn load_or_initialize_chunked_state(
+    workspace: &ChunkedWorkspace,
+    total_size: u64,
+    chunk_size: u64,
+    num_parts: u64,
+    models_dir_ownership: Option<Ownership>,
+) -> Result<ChunkedState> {
+    let num_parts_usize = usize::try_from(num_parts)
+        .map_err(|_| DownloaderError::Other("Blob has too many chunks".to_string()))?;
+
+    let mut reusable_state: Option<ChunkedState> = None;
+    if let Ok(raw) = fs::read_to_string(&workspace.state_file)
+        && let Ok(state) = serde_json::from_str::<ChunkedState>(&raw)
+        && state.version == CHUNKED_STATE_VERSION
+        && state.total_size == total_size
+        && state.chunk_size == chunk_size
+        && state.completed.len() == num_parts_usize
+        && fs::metadata(&workspace.data_file)
+            .map(|m| m.len() == total_size)
+            .unwrap_or(false)
+    {
+        reusable_state = Some(state);
     }
-    info!("Created parts directory: {:?}", parts_dir);
+
+    if let Some(state) = reusable_state {
+        return Ok(state);
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&workspace.data_file)?;
+    file.set_len(total_size)?;
+
+    if let Some(ownership) = models_dir_ownership {
+        ensure_ownership(&workspace.data_file, ownership);
+    }
+
+    let state = ChunkedState {
+        version: CHUNKED_STATE_VERSION,
+        total_size,
+        chunk_size,
+        completed: vec![false; num_parts_usize],
+    };
+    persist_chunked_state(&workspace.state_file, &state, models_dir_ownership)?;
+    Ok(state)
+}
+
+fn persist_chunked_state(
+    state_file: &Path,
+    state: &ChunkedState,
+    models_dir_ownership: Option<Ownership>,
+) -> Result<()> {
+    let temp_path = state_file.with_extension("state.tmp");
+    let payload = serde_json::to_vec_pretty(state)
+        .map_err(|e| DownloaderError::Other(format!("Failed to serialize chunk state: {}", e)))?;
+    fs::write(&temp_path, payload)?;
+    fs::rename(&temp_path, state_file)?;
+    if let Some(ownership) = models_dir_ownership {
+        ensure_ownership(state_file, ownership);
+    }
     Ok(())
 }
 
-fn scan_chunked_parts(
-    parts_dir: &Path,
+fn scan_chunk_state(
+    state: &ChunkedState,
     num_parts: u64,
     total_size: u64,
     chunk_size: u64,
@@ -650,10 +765,9 @@ fn scan_chunked_parts(
     let mut missing_parts: Vec<u64> = Vec::new();
 
     for part_idx in 0..num_parts {
-        let part_path = parts_dir.join(part_file_name(part_idx));
-        let expected = expected_part_size(part_idx, num_parts, total_size, chunk_size);
-        if is_part_complete(&part_path, expected) {
-            already_downloaded += expected;
+        let idx = part_idx as usize;
+        if state.completed[idx] {
+            already_downloaded += expected_part_size(part_idx, num_parts, total_size, chunk_size);
             completed_parts += 1;
         } else {
             missing_parts.push(part_idx);
@@ -670,7 +784,7 @@ fn scan_chunked_parts(
 fn log_scan_summary(named_digest: &str, num_parts: u64, scan: &ChunkedPartScan) {
     if scan.missing_parts.is_empty() {
         info!(
-            "All {} parts of {} are already on disk; assembling",
+            "All {} parts of {} are already downloaded; verifying digest",
             num_parts, named_digest
         );
         return;
@@ -686,398 +800,336 @@ fn log_scan_summary(named_digest: &str, num_parts: u64, scan: &ChunkedPartScan) 
     );
 }
 
-struct DownloadMissingPartsRequest<'a> {
+struct DownloadChunksParallelRequest<'a> {
     client: &'a Client,
     url: &'a str,
     named_digest: &'a str,
-    parts_dir: &'a Path,
+    workspace: &'a ChunkedWorkspace,
     missing_parts: &'a [u64],
+    state: &'a mut ChunkedState,
     num_parts: u64,
     chunk_size: u64,
     total_size: u64,
-    completed_parts: &'a mut u64,
+    already_downloaded: u64,
+    completed_parts: u64,
     pb: &'a ProgressBar,
     models_dir_ownership: Option<Ownership>,
+    download_chunks_in_parallel: bool,
 }
 
-fn download_missing_parts(request: DownloadMissingPartsRequest<'_>) -> Result<()> {
-    let DownloadMissingPartsRequest {
+fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) -> Result<bool> {
+    let DownloadChunksParallelRequest {
         client,
         url,
         named_digest,
-        parts_dir,
+        workspace,
         missing_parts,
+        state,
         num_parts,
         chunk_size,
         total_size,
+        already_downloaded,
         completed_parts,
         pb,
         models_dir_ownership,
+        download_chunks_in_parallel,
     } = request;
 
-    let mut buffer = [0u8; 8192];
-    for &part_idx in missing_parts {
-        download_one_missing_part(DownloadPartRequest {
-            client,
-            url,
-            named_digest,
-            parts_dir,
-            part_idx,
-            num_parts,
-            chunk_size,
-            total_size,
-            completed_parts,
-            pb,
-            models_dir_ownership,
-            buffer: &mut buffer,
-        })?;
+    if missing_parts.is_empty() {
+        return Ok(false);
     }
 
-    Ok(())
-}
+    let max_workers = if download_chunks_in_parallel {
+        MAX_PARALLEL_CHUNK_WORKERS
+    } else {
+        1
+    };
+    let workers = missing_parts.len().min(max_workers);
+    let queue = Arc::new(Mutex::new(VecDeque::from(missing_parts.to_vec())));
+    let bytes_done = Arc::new(AtomicU64::new(already_downloaded));
+    let parts_done = Arc::new(AtomicU64::new(completed_parts));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let first_error = Arc::new(Mutex::new(None::<DownloaderError>));
+    let (done_tx, done_rx) = mpsc::channel::<u64>();
 
-struct DownloadPartRequest<'a> {
-    client: &'a Client,
-    url: &'a str,
-    named_digest: &'a str,
-    parts_dir: &'a Path,
-    part_idx: u64,
-    num_parts: u64,
-    chunk_size: u64,
-    total_size: u64,
-    completed_parts: &'a mut u64,
-    pb: &'a ProgressBar,
-    models_dir_ownership: Option<Ownership>,
-    buffer: &'a mut [u8; 8192],
-}
+    let mut user_aborted = false;
+    let mut finished_missing: usize = 0;
+    let mut last_bytes_done = already_downloaded;
+    let mut refresh_interval = Duration::from_millis(CHUNKED_REFRESH_IDLE_MS);
 
-fn download_one_missing_part(request: DownloadPartRequest<'_>) -> Result<()> {
-    let DownloadPartRequest {
-        client,
-        url,
-        named_digest,
-        parts_dir,
-        part_idx,
-        num_parts,
-        chunk_size,
-        total_size,
-        completed_parts,
-        pb,
-        models_dir_ownership,
-        buffer,
-    } = request;
-
-    pb.set_message(format!(
-        "Downloading BLOB {} part {}/{}",
-        named_digest,
-        *completed_parts + 1,
-        num_parts
-    ));
-
-    let part_path = parts_dir.join(part_file_name(part_idx));
-    let expected_size = expected_part_size(part_idx, num_parts, total_size, chunk_size);
-    let range_start = part_idx * chunk_size;
-    let range_end = range_start + expected_size - 1;
-
-    ensure_chunked_interrupt_not_requested(pb, *completed_parts, part_idx, parts_dir, None)?;
-
-    let range_header = format!("bytes={}-{}", range_start, range_end);
-    let mut response =
-        fetch_chunked_part_response(client, url, &range_header, pb, parts_dir, named_digest)?;
-
-    let mut part_file = create_chunked_part_file(&part_path, pb, models_dir_ownership)?;
-    let bytes_written = stream_part_to_file(StreamPartRequest {
-        response: &mut response,
-        part_file: &mut part_file,
-        part_path: &part_path,
-        pb,
-        completed_parts: *completed_parts,
-        part_idx,
-        parts_dir,
-        buffer,
-    })?;
-
-    verify_part_size(
-        bytes_written,
-        expected_size,
-        part_idx,
-        named_digest,
-        &part_path,
-        pb,
-    )?;
-
-    debug!(
-        "Downloaded part {}/{} for {}",
-        part_idx + 1,
-        num_parts,
-        named_digest
-    );
-
-    *completed_parts += 1;
-    pb.set_message(format!(
-        "Downloading BLOB {} part {}/{}",
-        named_digest, *completed_parts, num_parts
-    ));
-
-    Ok(())
-}
-
-fn ensure_chunked_interrupt_not_requested(
-    pb: &ProgressBar,
-    completed_parts: u64,
-    part_idx: u64,
-    parts_dir: &Path,
-    part_path: Option<&Path>,
-) -> Result<()> {
-    if crate::signal_handler::is_interrupted() {
-        if let Some(part_path) = part_path {
-            warn!(
-                "Download interrupted by user while downloading part {}",
-                part_idx
-            );
-            drop_partial_part_and_maybe_cleanup(part_path, parts_dir);
-        } else {
-            warn!("Download interrupted by user before part {}", part_idx);
-            cleanup_parts_dir_if_requested(parts_dir);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let worker = ChunkWorker {
+                client: client.clone(),
+                url,
+                named_digest,
+                data_file: workspace.data_file.clone(),
+                queue: Arc::clone(&queue),
+                bytes_done: Arc::clone(&bytes_done),
+                parts_done: Arc::clone(&parts_done),
+                cancel: Arc::clone(&cancel),
+                first_error: Arc::clone(&first_error),
+                done_tx: done_tx.clone(),
+                num_parts,
+                chunk_size,
+                total_size,
+            };
+            scope.spawn(move || worker.run());
         }
-        pb.abandon();
+
+        drop(done_tx);
+
+        while finished_missing < missing_parts.len() {
+            if crate::signal_handler::is_interrupted() {
+                user_aborted = true;
+                cancel.store(true, Ordering::Release);
+                break;
+            }
+
+            if crate::signal_handler::interrupt_requested() {
+                let should_exit = pb.suspend(|| {
+                    crate::signal_handler::confirm_pending_interrupt_for_chunked(
+                        parts_done.load(Ordering::Acquire),
+                    )
+                });
+                if should_exit {
+                    user_aborted = true;
+                    cancel.store(true, Ordering::Release);
+                    break;
+                }
+            }
+
+            if first_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            {
+                cancel.store(true, Ordering::Release);
+                break;
+            }
+
+            match done_rx.recv_timeout(refresh_interval) {
+                Ok(part_idx) => {
+                    finished_missing += 1;
+                    let idx = part_idx as usize;
+                    if idx < state.completed.len() {
+                        state.completed[idx] = true;
+                        if let Err(e) = persist_chunked_state(
+                            &workspace.state_file,
+                            state,
+                            models_dir_ownership,
+                        ) {
+                            *first_error.lock().unwrap_or_else(|pe| pe.into_inner()) = Some(e);
+                            cancel.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            let current_bytes_done = bytes_done.load(Ordering::Acquire);
+            let bytes_delta = current_bytes_done.saturating_sub(last_bytes_done);
+            refresh_interval = if bytes_delta > 0 {
+                Duration::from_millis(CHUNKED_REFRESH_ACTIVE_MS)
+            } else {
+                Duration::from_millis(CHUNKED_REFRESH_IDLE_MS)
+            };
+            last_bytes_done = current_bytes_done;
+
+            pb.set_position(current_bytes_done);
+            pb.set_message(format!(
+                "Downloading BLOB {} part {}/{}",
+                named_digest,
+                (parts_done.load(Ordering::Acquire) + 1).min(num_parts),
+                num_parts
+            ));
+        }
+
+        cancel.store(true, Ordering::Release);
+    });
+
+    pb.set_position(bytes_done.load(Ordering::Acquire));
+
+    if let Some(err) = first_error.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Err(err);
+    }
+
+    if user_aborted {
+        return Ok(true);
+    }
+
+    if finished_missing < missing_parts.len() {
         return Err(DownloaderError::Other(
-            "Download interrupted by user".to_string(),
+            "Chunked download stopped before completion".to_string(),
         ));
     }
 
-    if crate::signal_handler::interrupt_requested() {
-        let should_exit = pb.suspend(|| {
-            crate::signal_handler::confirm_pending_interrupt_for_chunked(completed_parts)
-        });
-        if should_exit {
-            if let Some(part_path) = part_path {
-                warn!(
-                    "Download interrupted by user while downloading part {}",
-                    part_idx
-                );
-                drop_partial_part_and_maybe_cleanup(part_path, parts_dir);
-            } else {
-                warn!("Download interrupted by user before part {}", part_idx);
-                cleanup_parts_dir_if_requested(parts_dir);
-            }
-            pb.abandon();
-            return Err(DownloaderError::Other(
-                "Download interrupted by user".to_string(),
-            ));
-        }
-    }
-
-    Ok(())
+    Ok(false)
 }
 
-fn cleanup_parts_dir_if_requested(parts_dir: &Path) {
-    if !crate::signal_handler::keep_partial_downloads() {
-        let _ = fs::remove_dir_all(parts_dir);
-    }
-}
-
-fn drop_partial_part_and_maybe_cleanup(part_path: &Path, parts_dir: &Path) {
-    let _ = fs::remove_file(part_path);
-    cleanup_parts_dir_if_requested(parts_dir);
-}
-
-fn remove_partial_part_only(part_path: &Path) {
-    let _ = fs::remove_file(part_path);
-}
-
-fn fetch_chunked_part_response(
-    client: &Client,
-    url: &str,
-    range_header: &str,
-    pb: &ProgressBar,
-    parts_dir: &Path,
-    named_digest: &str,
-) -> Result<reqwest::blocking::Response> {
-    let response = match client.get(url).header("Range", range_header).send() {
-        Ok(r) => r,
-        Err(e) => {
-            pb.abandon();
-            return Err(DownloaderError::HttpError(e));
-        }
-    };
-
-    if response.status() == StatusCode::PARTIAL_CONTENT {
-        return Ok(response);
-    }
-
-    pb.abandon();
-    let status = response.status();
-    let _ = fs::remove_dir_all(parts_dir);
-    Err(DownloaderError::Other(format!(
-        "Expected 206 Partial Content for range request on {}, got {}",
-        named_digest, status
-    )))
-}
-
-fn create_chunked_part_file(
-    part_path: &Path,
-    pb: &ProgressBar,
-    models_dir_ownership: Option<Ownership>,
-) -> Result<fs::File> {
-    let part_file = match fs::File::create(part_path) {
-        Ok(f) => f,
-        Err(e) => {
-            pb.abandon();
-            return Err(DownloaderError::IoError(e));
-        }
-    };
-
-    if let Some(ownership) = models_dir_ownership {
-        ensure_ownership(part_path, ownership);
-    }
-
-    Ok(part_file)
-}
-
-struct StreamPartRequest<'a> {
-    response: &'a mut reqwest::blocking::Response,
-    part_file: &'a mut fs::File,
-    part_path: &'a Path,
-    pb: &'a ProgressBar,
-    completed_parts: u64,
-    part_idx: u64,
-    parts_dir: &'a Path,
-    buffer: &'a mut [u8; 8192],
-}
-
-fn stream_part_to_file(request: StreamPartRequest<'_>) -> Result<u64> {
-    let StreamPartRequest {
-        response,
-        part_file,
-        part_path,
-        pb,
-        completed_parts,
-        part_idx,
-        parts_dir,
-        buffer,
-    } = request;
-
-    let mut bytes_written: u64 = 0;
-
-    loop {
-        ensure_chunked_interrupt_not_requested(
-            pb,
-            completed_parts,
-            part_idx,
-            parts_dir,
-            Some(part_path),
-        )?;
-
-        let bytes_read = match response.read(buffer) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                pb.abandon();
-                remove_partial_part_only(part_path);
-                return Err(DownloaderError::IoError(e));
-            }
-        };
-
-        let chunk = &buffer[..bytes_read];
-        if let Err(e) = part_file.write_all(chunk) {
-            pb.abandon();
-            remove_partial_part_only(part_path);
-            return Err(DownloaderError::IoError(e));
-        }
-
-        bytes_written += bytes_read as u64;
-        pb.inc(bytes_read as u64);
-    }
-
-    Ok(bytes_written)
-}
-
-fn verify_part_size(
-    bytes_written: u64,
-    expected_size: u64,
-    part_idx: u64,
-    named_digest: &str,
-    part_path: &Path,
-    pb: &ProgressBar,
-) -> Result<()> {
-    if bytes_written == expected_size {
-        return Ok(());
-    }
-
-    warn!(
-        "Part {} incomplete: expected {} bytes, got {}",
-        part_idx, expected_size, bytes_written
-    );
-    let _ = fs::remove_file(part_path);
-    pb.abandon();
-    Err(DownloaderError::Other(format!(
-        "Part {} of {} incomplete ({}/{} bytes)",
-        part_idx, named_digest, bytes_written, expected_size
-    )))
-}
-
-fn create_assembly_targets() -> Result<(Sha256, NamedTempFile)> {
-    let hasher = Sha256::new();
-    let temp_file = NamedTempFile::new()?;
-    Ok((hasher, temp_file))
-}
-
-fn assemble_parts_into_file(
-    parts_dir: &Path,
+struct ChunkWorker<'a> {
+    client: Client,
+    url: &'a str,
+    named_digest: &'a str,
+    data_file: PathBuf,
+    queue: Arc<Mutex<VecDeque<u64>>>,
+    bytes_done: Arc<AtomicU64>,
+    parts_done: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    first_error: Arc<Mutex<Option<DownloaderError>>>,
+    done_tx: mpsc::Sender<u64>,
     num_parts: u64,
-    named_digest: &str,
-    hasher: &mut Sha256,
-    temp_file: &mut NamedTempFile,
-) -> Result<()> {
-    info!("Assembling {} parts for {}", num_parts, named_digest);
-    const ASSEMBLY_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-    let assembly_pb = ProgressBar::new(num_parts);
-    assembly_pb.set_style(
+    chunk_size: u64,
+    total_size: u64,
+}
+
+impl ChunkWorker<'_> {
+    fn run(self) {
+        loop {
+            if self.cancel.load(Ordering::Acquire) || crate::signal_handler::is_interrupted() {
+                return;
+            }
+
+            let next_part = {
+                let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                guard.pop_front()
+            };
+
+            let Some(part_idx) = next_part else {
+                return;
+            };
+
+            match self.download_one_part(part_idx) {
+                Ok(()) => {
+                    self.parts_done.fetch_add(1, Ordering::AcqRel);
+                    let _ = self.done_tx.send(part_idx);
+                }
+                Err(e) => {
+                    self.set_error_once(e);
+                    self.cancel.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn set_error_once(&self, err: DownloaderError) {
+        let mut guard = self.first_error.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(err);
+        }
+    }
+
+    fn download_one_part(&self, part_idx: u64) -> Result<()> {
+        let expected_size =
+            expected_part_size(part_idx, self.num_parts, self.total_size, self.chunk_size);
+        let range_start = part_idx * self.chunk_size;
+        let range_end = range_start + expected_size - 1;
+        let range_header = format!("bytes={}-{}", range_start, range_end);
+
+        let mut response = self
+            .client
+            .get(self.url)
+            .header("Range", &range_header)
+            .send()
+            .map_err(DownloaderError::HttpError)?;
+
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(DownloaderError::Other(format!(
+                "Expected 206 Partial Content for range request on {}, got {}",
+                self.named_digest,
+                response.status()
+            )));
+        }
+
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.data_file)
+            .map_err(DownloaderError::IoError)?;
+        out.seek(SeekFrom::Start(range_start))
+            .map_err(DownloaderError::IoError)?;
+
+        let mut bytes_written: u64 = 0;
+        let mut buffer = vec![0u8; CHUNK_IO_BUFFER_SIZE];
+
+        loop {
+            if self.cancel.load(Ordering::Acquire) || crate::signal_handler::is_interrupted() {
+                return Ok(());
+            }
+
+            let bytes_read = match response.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Err(DownloaderError::IoError(e)),
+            };
+
+            out.write_all(&buffer[..bytes_read])
+                .map_err(DownloaderError::IoError)?;
+            bytes_written += bytes_read as u64;
+            self.bytes_done
+                .fetch_add(bytes_read as u64, Ordering::AcqRel);
+        }
+
+        if bytes_written != expected_size {
+            return Err(DownloaderError::Other(format!(
+                "Part {} of {} incomplete ({}/{} bytes)",
+                part_idx, self.named_digest, bytes_written, expected_size
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn compute_file_sha256(path: &Path, named_digest: &str) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0u8; HASH_IO_BUFFER_SIZE];
+    let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    info!("Verifying downloaded BLOB {}", named_digest);
+
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
         ProgressStyle::default_bar()
-            .template("{msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
             .unwrap()
             .progress_chars("#>-"),
     );
-    assembly_pb.set_message(format!(
-        "Assembling BLOB {} part 0/{}",
-        named_digest, num_parts
-    ));
+    pb.set_message(format!("Verifying BLOB {}", named_digest));
 
-    for part_idx in 0..num_parts {
-        assembly_pb.set_message(format!(
-            "Assembling BLOB {} part {}/{}",
-            named_digest,
-            part_idx + 1,
-            num_parts
-        ));
-        let part_path = parts_dir.join(part_file_name(part_idx));
-        let mut part_file = fs::File::open(&part_path)?;
-        let mut read_buf = vec![0u8; ASSEMBLY_BUFFER_SIZE];
-
-        loop {
-            let n = part_file.read(&mut read_buf)?;
-            if n == 0 {
-                break;
-            }
-            let chunk = &read_buf[..n];
-            hasher.update(chunk);
-            temp_file.write_all(chunk)?;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
         }
-
-        assembly_pb.inc(1);
+        hasher.update(&buffer[..n]);
+        pb.inc(n as u64);
     }
 
-    assembly_pb.finish_with_message("Assembled parts");
+    pb.finish_with_message("Verified");
 
-    Ok(())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn remove_parts_directory_after_success(parts_dir: &Path) {
-    if let Err(e) = fs::remove_dir_all(parts_dir) {
-        warn!("Failed to remove parts directory {:?}: {}", parts_dir, e);
-    } else {
-        debug!("Removed parts directory {:?}", parts_dir);
+fn cleanup_chunk_workspace(workspace: &ChunkedWorkspace) {
+    if let Err(e) = fs::remove_file(&workspace.state_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove chunk state file {:?}: {}",
+            workspace.state_file, e
+        );
+    }
+    if let Err(e) = fs::remove_file(&workspace.data_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove chunk data file {:?}: {}",
+            workspace.data_file, e
+        );
     }
 }
 

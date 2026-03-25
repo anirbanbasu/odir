@@ -223,6 +223,34 @@ fn prompt_f64(prompt: &str, default: f64) -> f64 {
     }
 }
 
+/// Prompts the user for a u64 value chosen from a fixed list of allowed values.
+fn prompt_u64_choice(prompt: &str, default: u64, allowed: &[u64]) -> u64 {
+    loop {
+        let choices = allowed
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        print!("{} [{}] (allowed: {}): ", prompt, default, choices);
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let input = input.trim();
+
+        if input.is_empty() {
+            return default;
+        }
+
+        match input.parse::<u64>() {
+            Ok(value) if allowed.contains(&value) => return value,
+            Ok(_) => println!("Invalid choice. Please select one of: {}", choices),
+            Err(_) => println!("Invalid number. Please try again."),
+        }
+    }
+}
+
 /// Interactively configures application settings by prompting the user.
 ///
 /// # Arguments
@@ -293,6 +321,17 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
     settings.ollama_library.timeout = prompt_f64(
         "HTTP request timeout (seconds)",
         settings.ollama_library.timeout,
+    );
+
+    settings.ollama_library.chunk_size_mib = prompt_u64_choice(
+        "Chunk size for large blob downloads (MiB)",
+        settings.ollama_library.chunk_size_mib,
+        &[0, 32, 64, 128, 256, 512],
+    );
+
+    settings.ollama_library.download_chunks_in_parallel = prompt_bool(
+        "Download chunks in parallel?",
+        settings.ollama_library.download_chunks_in_parallel,
     );
 
     println!("\n=== Configuration Complete ===\n");
