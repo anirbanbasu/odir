@@ -299,6 +299,343 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
     settings
 }
 
+fn handle_show_config() {
+    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+        Ok(settings) => match serde_json::to_string_pretty(&settings) {
+            Ok(json) => {
+                println!("{}", json);
+                info!(
+                    "Settings loaded from {:?}",
+                    config::get_settings_file_path_or_panic()
+                );
+            }
+            Err(e) => {
+                error!("Failed to serialize settings: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            error!(
+                "Failed to load or create settings file '{:?}': {}",
+                config::get_settings_file_path_or_panic(),
+                e
+            );
+            // Provide helpful guidance to the user
+            if e.kind() == io::ErrorKind::InvalidData {
+                eprintln!("\n⚠ Settings file has validation errors that could not be recovered.");
+                eprintln!("  Try running 'odir edit-config' to fix your settings.\n");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_edit_config(config_file: Option<String>) {
+    // Determine config file path
+    let config_path = config_file
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(config::get_settings_file_path_or_panic);
+
+    // Try to load existing settings from the config file
+    let existing_settings = if config_path.exists() {
+        match AppSettings::load_settings(&config_path) {
+            Ok(settings) => {
+                info!("Loaded existing settings from: {}", config_path.display());
+                Some(settings)
+            }
+            Err(e) => {
+                warn!(
+                    "Settings file exists but could not be loaded: {}. Using defaults.",
+                    e
+                );
+                eprintln!(
+                    "\n⚠ Settings file has validation errors but default values have been used."
+                );
+                eprintln!("  Error: {}\n", e);
+                None
+            }
+        }
+    } else {
+        info!("No existing settings file found. Creating new configuration.");
+        None
+    };
+
+    // Interactively configure settings
+    let settings = interactive_config(existing_settings);
+
+    // Save settings to file
+    match settings.save_settings(&config_path) {
+        Ok(_) => {
+            println!(
+                "\n✓ Settings saved successfully to: {}",
+                config_path.display()
+            );
+            info!("Settings saved to: {}", config_path.display());
+
+            // Display the saved settings
+            match serde_json::to_string_pretty(&settings) {
+                Ok(json) => {
+                    println!("\nSaved configuration:");
+                    println!("{}", json);
+                }
+                Err(e) => {
+                    warn!("Failed to display saved settings: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "Failed to save settings to '{}': {}",
+                config_path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_list_models(page: Option<u32>, page_size: Option<u32>) {
+    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+        Ok(settings) => match OllamaModelDownloader::new(settings) {
+            Ok(downloader) => match downloader.list_available_models(page, page_size) {
+                Ok(models) => {
+                    if let (Some(p), Some(_ps)) = (page, page_size) {
+                        println!(
+                            "Model identifiers: ({}, page {}): {:?}",
+                            models.len(),
+                            p,
+                            models
+                        );
+                    } else {
+                        println!("Model identifiers: ({}): {:?}", models.len(), models);
+                    }
+                }
+                Err(e) => {
+                    error!("Error listing models: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                error!("Failed to create Ollama downloader: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_list_tags(model_identifier: String) {
+    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+        Ok(settings) => match OllamaModelDownloader::new(settings) {
+            Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
+                Ok(tags) => {
+                    println!("Model tags: ({} tags): {:?}", tags.len(), tags);
+                }
+                Err(e) => {
+                    error!("Error listing tags for model '{}': {}", model_identifier, e);
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                error!("Failed to create Ollama downloader: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_model_download(model_tag: String) {
+    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+        Ok(settings) => match OllamaModelDownloader::new(settings) {
+            Ok(downloader) => match downloader.download_model(&model_tag) {
+                Ok(_) => {
+                    println!("Model {} download completed successfully", model_tag);
+                    signal_handler::set_cleanup_done();
+                }
+                Err(e) => {
+                    error!("Error downloading model '{}': {}", model_tag, e);
+                    if !signal_handler::is_interrupted() {
+                        std::process::exit(1);
+                    }
+                    signal_handler::set_cleanup_done();
+                }
+            },
+            Err(e) => {
+                error!("Failed to create Ollama downloader: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_hf_list_models(page: u32, page_size: u32) {
+    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+        Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
+            Ok(downloader) => match downloader.list_available_models(Some(page), Some(page_size)) {
+                Ok(models) => {
+                    println!(
+                        "Model identifiers: ({}, page {}): {:?}",
+                        models.len(),
+                        page,
+                        models
+                    );
+                }
+                Err(e) => {
+                    error!("Error listing HuggingFace models: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                error!("Failed to create HuggingFace downloader: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_hf_list_tags(model_identifier: String) {
+    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+        Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
+            Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
+                Ok(tags) => {
+                    println!("Model tags: ({} tags): {:?}", tags.len(), tags);
+                }
+                Err(e) => {
+                    error!(
+                        "Error listing tags for HuggingFace model '{}': {}",
+                        model_identifier, e
+                    );
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                error!("Failed to create HuggingFace downloader: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_hf_model_download(user_repo_quant: String) {
+    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+        Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
+            Ok(downloader) => match downloader.download_model(&user_repo_quant) {
+                Ok(_) => {
+                    println!(
+                        "HuggingFace model {} download completed successfully",
+                        user_repo_quant
+                    );
+                    signal_handler::set_cleanup_done();
+                }
+                Err(e) => {
+                    error!(
+                        "Error downloading HuggingFace model '{}': {}",
+                        user_repo_quant, e
+                    );
+                    if !signal_handler::is_interrupted() {
+                        std::process::exit(1);
+                    }
+                    signal_handler::set_cleanup_done();
+                }
+            },
+            Err(e) => {
+                error!("Failed to create HuggingFace downloader: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_od_copy_settings(od_settings_file: String) {
+    use std::fs;
+    use std::path::Path;
+
+    let source_path = Path::new(&od_settings_file);
+    let dest_path = config::get_settings_file_path_or_panic();
+
+    // Check if source file exists
+    if !source_path.exists() {
+        error!("Source settings file does not exist: {}", od_settings_file);
+        std::process::exit(1);
+    }
+
+    // Check if source file is readable
+    if let Err(e) = fs::metadata(source_path) {
+        error!(
+            "Cannot access source settings file '{}': {}",
+            od_settings_file, e
+        );
+        std::process::exit(1);
+    }
+
+    // Check if destination file already exists
+    if dest_path.exists() {
+        println!("Settings file already exists at: {}", dest_path.display());
+        print!("Overwrite existing settings file? [y/N]: ");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        if let Err(e) = io::stdin().read_line(&mut input) {
+            error!("Failed to read user input: {}", e);
+            std::process::exit(1);
+        }
+
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            info!("Operation cancelled by user.");
+            return;
+        }
+    }
+
+    // Copy the file
+    match fs::copy(source_path, &dest_path) {
+        Ok(_) => {
+            info!(
+                "Successfully copied settings from '{}' to '{}'",
+                od_settings_file,
+                dest_path.display()
+            );
+            println!(
+                "Settings file copied successfully to: {}",
+                dest_path.display()
+            );
+        }
+        Err(e) => {
+            error!(
+                "Failed to copy settings from '{}' to '{}': {}",
+                od_settings_file,
+                dest_path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// The main entry point for the Ollama Downloader in Rust (ODIR) command-line application.
 fn main() {
     // Initialize configuration from environment variables
@@ -333,337 +670,14 @@ fn main() {
     signal_handler::set_confirmation_required(requires_interrupt_confirmation);
 
     match cli.command {
-        Commands::ShowConfig => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-                Ok(settings) => match serde_json::to_string_pretty(&settings) {
-                    Ok(json) => {
-                        println!("{}", json);
-                        info!(
-                            "Settings loaded from {:?}",
-                            config::get_settings_file_path_or_panic()
-                        );
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize settings: {}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    error!(
-                        "Failed to load or create settings file '{:?}': {}",
-                        config::get_settings_file_path_or_panic(),
-                        e
-                    );
-                    // Provide helpful guidance to the user
-                    if e.kind() == io::ErrorKind::InvalidData {
-                        eprintln!(
-                            "\n⚠ Settings file has validation errors that could not be recovered."
-                        );
-                        eprintln!("  Try running 'odir edit-config' to fix your settings.\n");
-                    }
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::EditConfig { config_file } => {
-            // Determine config file path
-            let config_path = config_file
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(config::get_settings_file_path_or_panic);
-
-            // Try to load existing settings from the config file
-            let existing_settings = if config_path.exists() {
-                match AppSettings::load_settings(&config_path) {
-                    Ok(settings) => {
-                        info!("Loaded existing settings from: {}", config_path.display());
-                        Some(settings)
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Settings file exists but could not be loaded: {}. Using defaults.",
-                            e
-                        );
-                        eprintln!(
-                            "\n⚠ Settings file has validation errors but default values have been used."
-                        );
-                        eprintln!("  Error: {}\n", e);
-                        None
-                    }
-                }
-            } else {
-                info!("No existing settings file found. Creating new configuration.");
-                None
-            };
-
-            // Interactively configure settings
-            let settings = interactive_config(existing_settings);
-
-            // Save settings to file
-            match settings.save_settings(&config_path) {
-                Ok(_) => {
-                    println!(
-                        "\n✓ Settings saved successfully to: {}",
-                        config_path.display()
-                    );
-                    info!("Settings saved to: {}", config_path.display());
-
-                    // Display the saved settings
-                    match serde_json::to_string_pretty(&settings) {
-                        Ok(json) => {
-                            println!("\nSaved configuration:");
-                            println!("{}", json);
-                        }
-                        Err(e) => {
-                            warn!("Failed to display saved settings: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to save settings to '{}': {}",
-                        config_path.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::ListModels { page, page_size } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-                Ok(settings) => match OllamaModelDownloader::new(settings) {
-                    Ok(downloader) => match downloader.list_available_models(page, page_size) {
-                        Ok(models) => {
-                            if let (Some(p), Some(_ps)) = (page, page_size) {
-                                println!(
-                                    "Model identifiers: ({}, page {}): {:?}",
-                                    models.len(),
-                                    p,
-                                    models
-                                );
-                            } else {
-                                println!("Model identifiers: ({}): {:?}", models.len(), models);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error listing models: {}", e);
-                            std::process::exit(1);
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to create Ollama downloader: {}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to load settings: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::ListTags { model_identifier } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-                Ok(settings) => match OllamaModelDownloader::new(settings) {
-                    Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
-                        Ok(tags) => {
-                            println!("Model tags: ({} tags): {:?}", tags.len(), tags);
-                        }
-                        Err(e) => {
-                            error!("Error listing tags for model '{}': {}", model_identifier, e);
-                            std::process::exit(1);
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to create Ollama downloader: {}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to load settings: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::ModelDownload { model_tag } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-                Ok(settings) => match OllamaModelDownloader::new(settings) {
-                    Ok(downloader) => match downloader.download_model(&model_tag) {
-                        Ok(_) => {
-                            println!("Model {} download completed successfully", model_tag);
-                            signal_handler::set_cleanup_done();
-                        }
-                        Err(e) => {
-                            error!("Error downloading model '{}': {}", model_tag, e);
-                            if !signal_handler::is_interrupted() {
-                                std::process::exit(1);
-                            }
-                            signal_handler::set_cleanup_done();
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to create Ollama downloader: {}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to load settings: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::HfListModels { page, page_size } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-                Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
-                    Ok(downloader) => {
-                        match downloader.list_available_models(Some(page), Some(page_size)) {
-                            Ok(models) => {
-                                println!(
-                                    "Model identifiers: ({}, page {}): {:?}",
-                                    models.len(),
-                                    page,
-                                    models
-                                );
-                            }
-                            Err(e) => {
-                                error!("Error listing HuggingFace models: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to create HuggingFace downloader: {}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to load settings: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::HfListTags { model_identifier } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-                Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
-                    Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
-                        Ok(tags) => {
-                            println!("Model tags: ({} tags): {:?}", tags.len(), tags);
-                        }
-                        Err(e) => {
-                            error!(
-                                "Error listing tags for HuggingFace model '{}': {}",
-                                model_identifier, e
-                            );
-                            std::process::exit(1);
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to create HuggingFace downloader: {}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to load settings: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::HfModelDownload { user_repo_quant } => {
-            match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-                Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
-                    Ok(downloader) => match downloader.download_model(&user_repo_quant) {
-                        Ok(_) => {
-                            println!(
-                                "HuggingFace model {} download completed successfully",
-                                user_repo_quant
-                            );
-                            signal_handler::set_cleanup_done();
-                        }
-                        Err(e) => {
-                            error!(
-                                "Error downloading HuggingFace model '{}': {}",
-                                user_repo_quant, e
-                            );
-                            if !signal_handler::is_interrupted() {
-                                std::process::exit(1);
-                            }
-                            signal_handler::set_cleanup_done();
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to create HuggingFace downloader: {}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to load settings: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::OdCopySettings { od_settings_file } => {
-            use std::fs;
-            use std::path::Path;
-
-            let source_path = Path::new(&od_settings_file);
-            let dest_path = config::get_settings_file_path_or_panic();
-
-            // Check if source file exists
-            if !source_path.exists() {
-                error!("Source settings file does not exist: {}", od_settings_file);
-                std::process::exit(1);
-            }
-
-            // Check if source file is readable
-            if let Err(e) = fs::metadata(source_path) {
-                error!(
-                    "Cannot access source settings file '{}': {}",
-                    od_settings_file, e
-                );
-                std::process::exit(1);
-            }
-
-            // Check if destination file already exists
-            if dest_path.exists() {
-                println!("Settings file already exists at: {}", dest_path.display());
-                print!("Overwrite existing settings file? [y/N]: ");
-                io::stdout().flush().unwrap();
-
-                let mut input = String::new();
-                if let Err(e) = io::stdin().read_line(&mut input) {
-                    error!("Failed to read user input: {}", e);
-                    std::process::exit(1);
-                }
-
-                let input = input.trim().to_lowercase();
-                if input != "y" && input != "yes" {
-                    info!("Operation cancelled by user.");
-                    return;
-                }
-            }
-
-            // Copy the file
-            match fs::copy(source_path, &dest_path) {
-                Ok(_) => {
-                    info!(
-                        "Successfully copied settings from '{}' to '{}'",
-                        od_settings_file,
-                        dest_path.display()
-                    );
-                    println!(
-                        "Settings file copied successfully to: {}",
-                        dest_path.display()
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to copy settings from '{}' to '{}': {}",
-                        od_settings_file,
-                        dest_path.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
+        Commands::ShowConfig => handle_show_config(),
+        Commands::EditConfig { config_file } => handle_edit_config(config_file),
+        Commands::ListModels { page, page_size } => handle_list_models(page, page_size),
+        Commands::ListTags { model_identifier } => handle_list_tags(model_identifier),
+        Commands::ModelDownload { model_tag } => handle_model_download(model_tag),
+        Commands::HfListModels { page, page_size } => handle_hf_list_models(page, page_size),
+        Commands::HfListTags { model_identifier } => handle_hf_list_tags(model_identifier),
+        Commands::HfModelDownload { user_repo_quant } => handle_hf_model_download(user_repo_quant),
+        Commands::OdCopySettings { od_settings_file } => handle_od_copy_settings(od_settings_file),
     }
 }
