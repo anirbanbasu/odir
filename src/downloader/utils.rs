@@ -170,7 +170,24 @@ pub fn download_model_blob(
     blobs_dir: Option<&Path>,
     models_dir_ownership: Option<Ownership>,
 ) -> Result<(PathBuf, String)> {
-    // Check for interruption before starting download
+    ensure_download_not_interrupted()?;
+
+    if let Some(result) = try_download_model_blob_chunked(ChunkedBlobProbe {
+        client,
+        url,
+        named_digest,
+        unnecessary_files,
+        chunk_size_bytes,
+        blobs_dir,
+        models_dir_ownership,
+    }) {
+        return result;
+    }
+
+    download_model_blob_single_stream(client, url, named_digest, unnecessary_files)
+}
+
+fn ensure_download_not_interrupted() -> Result<()> {
     if crate::signal_handler::is_interrupted() {
         warn!("Download interrupted by user");
         return Err(DownloaderError::Other(
@@ -184,92 +201,126 @@ pub fn download_model_blob(
         ));
     }
 
-    // If chunked downloading is enabled and we know where the blobs live,
-    // detect byte-range support with a robust probe:
-    // 1) use HEAD hints when available, 2) fall back to active Range probe.
-    if chunk_size_bytes > 0
-        && let Some(blobs_dir) = blobs_dir
-    {
-        let mut total_size: u64 = 0;
-        let mut range_supported = false;
+    Ok(())
+}
 
-        match client.head(url).send() {
-            Ok(head_resp) if head_resp.status().is_success() => {
-                total_size = head_resp.content_length().unwrap_or(0);
-                range_supported = head_resp
-                    .headers()
-                    .get("accept-ranges")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.eq_ignore_ascii_case("bytes"))
-                    .unwrap_or(false);
+struct ChunkedBlobProbe<'a> {
+    client: &'a Client,
+    url: &'a str,
+    named_digest: &'a str,
+    unnecessary_files: &'a mut HashSet<PathBuf>,
+    chunk_size_bytes: u64,
+    blobs_dir: Option<&'a Path>,
+    models_dir_ownership: Option<Ownership>,
+}
 
-                if range_supported {
-                    debug!("HEAD indicates byte-range support for {}", named_digest);
-                }
-            }
-            Ok(head_resp) => {
-                debug!(
-                    "HEAD returned non-success ({}) for {}; trying active range probe",
-                    head_resp.status(),
-                    named_digest
-                );
-            }
-            Err(e) => {
-                debug!(
-                    "HEAD failed for {}: {}; trying active range probe",
-                    named_digest, e
-                );
+fn try_download_model_blob_chunked(
+    request: ChunkedBlobProbe<'_>,
+) -> Option<Result<(PathBuf, String)>> {
+    let ChunkedBlobProbe {
+        client,
+        url,
+        named_digest,
+        unnecessary_files,
+        chunk_size_bytes,
+        blobs_dir,
+        models_dir_ownership,
+    } = request;
+
+    if chunk_size_bytes == 0 {
+        return None;
+    }
+
+    let blobs_dir = blobs_dir?;
+
+    // Detect byte-range support robustly: use HEAD hints when available,
+    // then fall back to an active range probe when needed.
+    let mut total_size: u64 = 0;
+    let mut range_supported = false;
+
+    match client.head(url).send() {
+        Ok(head_resp) if head_resp.status().is_success() => {
+            total_size = head_resp.content_length().unwrap_or(0);
+            range_supported = head_resp
+                .headers()
+                .get("accept-ranges")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false);
+
+            if range_supported {
+                debug!("HEAD indicates byte-range support for {}", named_digest);
             }
         }
-
-        // Run the active probe when range support is not yet confirmed, OR when
-        // HEAD confirmed it but omitted Content-Length (total_size == 0). The
-        // probe's Content-Range response gives us the total size in both cases.
-        if !range_supported || total_size == 0 {
-            let (probe_supported, probe_total_size) =
-                probe_byte_range_support(client, url, named_digest);
-            if !range_supported {
-                range_supported = probe_supported;
-            }
-            if total_size == 0 {
-                total_size = probe_total_size.unwrap_or(0);
-            }
-        }
-
-        if range_supported {
-            if total_size > chunk_size_bytes {
-                debug!(
-                    "Using chunked download for {} ({} bytes, {} byte chunks)",
-                    named_digest, total_size, chunk_size_bytes
-                );
-                return download_model_blob_chunked(ChunkedBlobDownload {
-                    client,
-                    url,
-                    named_digest,
-                    unnecessary_files,
-                    chunk_size: chunk_size_bytes,
-                    blobs_dir,
-                    total_size,
-                    models_dir_ownership,
-                });
-            }
-
-            if total_size == 0 {
-                warn!(
-                    "Byte-range probe succeeded for {}, but total size is unknown; \
-                         falling back to single-stream download",
-                    named_digest
-                );
-            }
-        } else {
-            warn!(
-                "Server does not support byte-range probe for {}; \
-                     falling back to single-stream download",
+        Ok(head_resp) => {
+            debug!(
+                "HEAD returned non-success ({}) for {}; trying active range probe",
+                head_resp.status(),
                 named_digest
+            );
+        }
+        Err(e) => {
+            debug!(
+                "HEAD failed for {}: {}; trying active range probe",
+                named_digest, e
             );
         }
     }
 
+    // Run active probe when support is unknown, or when HEAD omitted size.
+    if !range_supported || total_size == 0 {
+        let (probe_supported, probe_total_size) =
+            probe_byte_range_support(client, url, named_digest);
+        if !range_supported {
+            range_supported = probe_supported;
+        }
+        if total_size == 0 {
+            total_size = probe_total_size.unwrap_or(0);
+        }
+    }
+
+    if range_supported && total_size > chunk_size_bytes {
+        debug!(
+            "Using chunked download for {} ({} bytes, {} byte chunks)",
+            named_digest, total_size, chunk_size_bytes
+        );
+        return Some(download_model_blob_chunked(ChunkedBlobDownload {
+            client,
+            url,
+            named_digest,
+            unnecessary_files,
+            chunk_size: chunk_size_bytes,
+            blobs_dir,
+            total_size,
+            models_dir_ownership,
+        }));
+    }
+
+    if range_supported {
+        if total_size == 0 {
+            warn!(
+                "Byte-range probe succeeded for {}, but total size is unknown; \
+                         falling back to single-stream download",
+                named_digest
+            );
+        }
+    } else {
+        warn!(
+            "Server does not support byte-range probe for {}; \
+                     falling back to single-stream download",
+            named_digest
+        );
+    }
+
+    None
+}
+
+fn download_model_blob_single_stream(
+    client: &Client,
+    url: &str,
+    named_digest: &str,
+    unnecessary_files: &mut HashSet<PathBuf>,
+) -> Result<(PathBuf, String)> {
     let mut hasher = Sha256::new();
     let mut temp_file = NamedTempFile::new().map_err(DownloaderError::IoError)?;
 
@@ -293,7 +344,7 @@ pub fn download_model_blob(
             .unwrap()
             .progress_chars("#>-"),
     );
-    pb.set_message(format!("Downloading BLOB {}", &named_digest));
+    pb.set_message(format!("Downloading BLOB {}", named_digest));
 
     struct ProgressGuard;
     impl Drop for ProgressGuard {
@@ -305,30 +356,11 @@ pub fn download_model_blob(
     crate::signal_handler::set_progress_active(true);
     let _progress_guard = ProgressGuard;
 
-    // Stream chunks from the response
     let mut response_reader = response;
     let mut buffer = [0u8; 8192];
 
     loop {
-        // Check for interruption signal during download
-        if crate::signal_handler::is_interrupted() {
-            warn!("Download interrupted by user while downloading BLOB");
-            pb.abandon();
-            return Err(DownloaderError::Other(
-                "Download interrupted by user".to_string(),
-            ));
-        }
-
-        if crate::signal_handler::interrupt_requested() {
-            let should_exit = pb.suspend(crate::signal_handler::confirm_pending_interrupt);
-            if should_exit {
-                warn!("Download interrupted by user while downloading BLOB");
-                pb.abandon();
-                return Err(DownloaderError::Other(
-                    "Download interrupted by user".to_string(),
-                ));
-            }
-        }
+        check_single_stream_interrupt(&pb)?;
 
         let bytes_read = response_reader.read(&mut buffer)?;
         if bytes_read == 0 {
@@ -347,13 +379,35 @@ pub fn download_model_blob(
     debug!("Downloaded {} to {:?}", url, temp_path);
     debug!("Computed SHA256 digest: {}", computed_digest);
 
-    // Persist the temp file
     let persisted_path = temp_file.into_temp_path();
     let final_path = persisted_path
         .keep()
         .map_err(|e| DownloaderError::Other(format!("Failed to persist temp file: {}", e)))?;
 
     Ok((final_path, computed_digest))
+}
+
+fn check_single_stream_interrupt(pb: &ProgressBar) -> Result<()> {
+    if crate::signal_handler::is_interrupted() {
+        warn!("Download interrupted by user while downloading BLOB");
+        pb.abandon();
+        return Err(DownloaderError::Other(
+            "Download interrupted by user".to_string(),
+        ));
+    }
+
+    if crate::signal_handler::interrupt_requested() {
+        let should_exit = pb.suspend(crate::signal_handler::confirm_pending_interrupt);
+        if should_exit {
+            warn!("Download interrupted by user while downloading BLOB");
+            pb.abandon();
+            return Err(DownloaderError::Other(
+                "Download interrupted by user".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse the complete length from a Content-Range value.
