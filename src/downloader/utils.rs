@@ -403,7 +403,7 @@ fn download_model_blob_single_stream(
 
     pb.finish_with_message("Downloaded");
 
-    let computed_digest = format!("{:x}", hasher.finalize());
+    let computed_digest = hex::encode(hasher.finalize());
     debug!("Downloaded {} to {:?}", url, temp_path);
     debug!("Computed SHA256 digest: {}", computed_digest);
 
@@ -1248,7 +1248,7 @@ fn compute_file_sha256(path: &Path, named_digest: &str) -> Result<String> {
 
     pb.finish_with_message("Verified");
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn cleanup_chunk_workspace(workspace: &ChunkedWorkspace) {
