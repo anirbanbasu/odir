@@ -1,0 +1,51 @@
+name: TLS guard
+
+permissions:
+    contents: read
+
+on:
+    push:
+        branches: ["master"]
+        paths:
+            - "src/**/*.rs"
+            - ".github/workflows/tls-guard.yml"
+    pull_request:
+        branches: ["master"]
+        paths:
+            - "src/**/*.rs"
+            - ".github/workflows/tls-guard.yml"
+
+jobs:
+    allowlist-danger-accept-invalid-certs:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Ensure insecure TLS override is only used in approved helper
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  allowed_file='src/downloader/http_client.rs'
+                  matches="$(rg --line-number --no-heading 'danger_accept_invalid_certs' src || true)"
+
+                  if [[ -z "$matches" ]]; then
+                    echo 'No danger_accept_invalid_certs usage found.'
+                    exit 0
+                  fi
+
+                  echo "$matches"
+
+                  disallowed="$(printf '%s\n' "$matches" | grep -v "^${allowed_file}:" || true)"
+                  if [[ -n "$disallowed" ]]; then
+                    echo 'Found disallowed danger_accept_invalid_certs usage outside approved helper:' >&2
+                    echo "$disallowed" >&2
+                    exit 1
+                  fi
+
+                  match_count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+                  if [[ "$match_count" -ne 1 ]]; then
+                    echo "Expected exactly one approved danger_accept_invalid_certs usage, found ${match_count}." >&2
+                    exit 1
+                  fi

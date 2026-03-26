@@ -1,5 +1,6 @@
 //! Downloader implementation for Ollama library models.
 use crate::config::AppSettings;
+use crate::downloader::http_client::build_registry_client;
 use crate::downloader::manifest::ImageManifest;
 use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};
 use crate::downloader::utils::{
@@ -36,14 +37,7 @@ impl OllamaModelDownloader {
         let os_info = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let user_agent = format!("odir/{} ({})", pkg_version, os_info);
 
-        // codeql[rust/disabled-certificate-check]
-        let client = Client::builder()
-            .user_agent(&user_agent)
-            .danger_accept_invalid_certs(!settings.ollama_library.verify_ssl) // This is required to support users who have custom CAs or are in environments where SSL verification fails.
-            .timeout(std::time::Duration::from_secs_f64(
-                settings.ollama_library.timeout,
-            ))
-            .build()?;
+        let client = build_registry_client(&user_agent, &settings.ollama_library)?;
 
         let models_dir_ownership =
             infer_models_dir_ownership(&settings.ollama_library.models_path)?;
