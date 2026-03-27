@@ -1,4 +1,4 @@
-# Ollama Downloader in Rust (ODIR or _oh dear_!)
+# Ollama Downloader in Rust (ODIR or _oh dear_)
 
 [![Rust tests](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml) [![Markdown Lint](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml) [![CodeQL Advanced](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/anirbanbasu/odir/badge)](https://scorecard.dev/viewer/?uri=github.com/anirbanbasu/odir) [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/11975/badge)](https://www.bestpractices.dev/projects/11975)
 
@@ -67,6 +67,8 @@ Let's explore the configuration in details. The default content is as follows.
         "library_base_url": "https://ollama.com/library",
         "verify_ssl": true,
         "timeout": 120.0,
+        "chunk_size_mib": 128,
+        "download_chunks_in_parallel": true
     }
 }
 ```
@@ -87,6 +89,8 @@ There are two main configuration groups: `ollama_server` and `ollama_library`. T
 - Likewise, the `library_base_url` is the URL to the Ollama library. Keep the default value unless you really need to point it to some mirror.
 - The `verify_ssl` is a flag that tells the downloader tool to verify the authenticity of the HTTPS connections it makes to the Ollama registry or the library. Turn this off only if you have a man-in-the-middle proxy with self-signed certificates. Even in that case, typically environment variables `SSL_CERT_FILE` and `SSL_CERT_DIR` can be correctly configured to validate such certificates.
 - The self-explanatory `timeout` specifies the number of seconds to wait before any HTTPS connection to the Ollama registry or library should be allowed to fail.
+- The `chunk_size_mib` controls the size (in MiB) of each chunk when downloading large model blobs. Large blobs are split into sequential byte-range requests of this size, which makes downloads more robust over unreliable connections. If a download is interrupted by a network error, only the missing parts will be re-fetched on the next run. Set to `0` to disable chunked downloading and download each blob in a single stream. The value must be one of `0`, `32`, `64`, `128`, `256`, or `512`. The default is `128` (128 MiB). Note that if the remote server does not support chunked downloading, or if the blob is smaller than the configured chunk size, the download will automatically fall back to single-stream mode regardless of this setting.
+- The `download_chunks_in_parallel` controls whether chunked downloads use multiple workers (`true`) or a single worker (`false`). The default is `true`. This setting has effect only when chunked downloading is active (`chunk_size_mib > 0`) and the server supports byte-range downloads.
 
 ## Environment variables
 
@@ -109,9 +113,9 @@ odir --help
 The output will be as follows.
 
 ```bash
-A command-line interface for the Ollama Downloader in Rust (ODIR), which is a Rust port and successor of the Python-based [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader)
+Ollama Downloader in Rust (ODIR), pronounced oh dear, is a command-line tool written in Rust for downloading models from Ollama.
 
-Usage: odir [OPTIONS] <COMMAND> [ARGS]...
+Usage: odir <COMMAND>
 
 Commands:
   show-config        Shows the application configuration as JSON
