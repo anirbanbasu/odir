@@ -2,6 +2,7 @@
 //! including implementations for Hugging Face and Ollama library models,
 //! as well as utility functions for downloading and managing model files.
 pub mod hf_downloader;
+pub mod http_client;
 pub mod manifest;
 pub mod model_downloader;
 pub mod ollama_downloader;

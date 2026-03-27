@@ -1,11 +1,12 @@
 //! Downloader implementation for Hugging Face Ollama compatible models.
 use crate::config::AppSettings;
+use crate::downloader::http_client::build_registry_client;
 use crate::downloader::manifest::ImageManifest;
 use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};
 use crate::downloader::utils::{
-    Ownership, cleanup_unnecessary_files, download_model_blob, expand_models_path,
-    infer_models_dir_ownership, is_model_present_in_ollama, save_blob, save_manifest,
-    warn_if_models_path_requires_root,
+    BlobDownloadRequest, Ownership, cleanup_unnecessary_files, download_model_blob,
+    expand_models_path, infer_models_dir_ownership, is_model_present_in_ollama, save_blob,
+    save_manifest, warn_if_models_path_requires_root,
 };
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
@@ -54,13 +55,7 @@ impl HuggingFaceModelDownloader {
         let os_info = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let user_agent = format!("odir/{} ({})", pkg_version, os_info);
 
-        let client = Client::builder()
-            .user_agent(&user_agent)
-            .danger_accept_invalid_certs(!settings.ollama_library.verify_ssl)
-            .timeout(std::time::Duration::from_secs_f64(
-                settings.ollama_library.timeout,
-            ))
-            .build()?;
+        let client = build_registry_client(&user_agent, &settings.ollama_library)?;
 
         let models_dir_ownership =
             infer_models_dir_ownership(&settings.ollama_library.models_path)?;
@@ -103,22 +98,30 @@ impl HuggingFaceModelDownloader {
     }
 
     /// Download a model blob with progress tracking
-    fn download_model_blob(
+    fn download_blob_for_model(
         &mut self,
         model_repo: &str,
         named_digest: &str,
     ) -> Result<(PathBuf, String)> {
         let url = self.make_blob_url(model_repo, named_digest);
-        download_model_blob(
-            &self.client,
-            &url,
+        let blobs_dir = expand_models_path(&self.settings.ollama_library.models_path)
+            .ok()
+            .map(|p| p.join("blobs"));
+        let chunk_size = self.settings.ollama_library.chunk_size_mib * 1024 * 1024;
+        download_model_blob(BlobDownloadRequest {
+            client: &self.client,
+            url: &url,
             named_digest,
-            &mut self.unnecessary_files,
-        )
+            unnecessary_files: &mut self.unnecessary_files,
+            chunk_size_bytes: chunk_size,
+            blobs_dir: blobs_dir.as_deref(),
+            models_dir_ownership: self.models_dir_ownership,
+            download_chunks_in_parallel: self.settings.ollama_library.download_chunks_in_parallel,
+        })
     }
 
     /// Save the blob to the models directory
-    fn save_blob(
+    fn persist_blob(
         &mut self,
         source: &Path,
         named_digest: &str,
@@ -226,7 +229,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         // Download model configuration BLOB
         info!("Downloading model configuration {}", manifest.config.digest);
         let (file_model_config, digest_model_config) =
-            match self_mut.download_model_blob(&model_repo, &manifest.config.digest) {
+            match self_mut.download_blob_for_model(&model_repo, &manifest.config.digest) {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Failed to download model configuration: {}", e);
@@ -266,7 +269,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
 
                 info!("Downloading {} layer {}", layer.media_type, layer.digest);
                 let (file_layer, digest_layer) =
-                    match self_mut.download_model_blob(&model_repo, &layer.digest) {
+                    match self_mut.download_blob_for_model(&model_repo, &layer.digest) {
                         Ok(result) => result,
                         Err(e) => {
                             error!("Failed to download layer {}: {}", layer.digest, e);
@@ -280,7 +283,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
 
         // All BLOBs downloaded, now save them
         for (source, named_digest, computed_digest) in files_to_be_copied {
-            match self_mut.save_blob(&source, &named_digest, &computed_digest) {
+            match self_mut.persist_blob(&source, &named_digest, &computed_digest) {
                 Ok(_) => {
                     // Cleanup source file
                     let _ = fs::remove_file(&source);
@@ -524,29 +527,36 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run manually with: cargo test -- --ignored
-    fn test_hf_model_download() {
-        // Initialize logger for test output
-        let _ = env_logger::builder().is_test(true).try_init();
-
+    fn test_hf_list_models() {
         let settings = AppSettings::default();
         let downloader =
             HuggingFaceModelDownloader::new(settings).expect("Failed to create downloader");
 
-        // Download a small model for testing
-        let model_identifier = "unsloth/SmolLM2-135M-Instruct-GGUF:Q4_K_M";
-        println!("Testing download of {}", model_identifier);
+        let result = downloader.list_available_models(None, None);
 
-        let result = downloader.download_model(model_identifier);
+        assert!(result.is_ok(), "list_available_models should succeed");
+        let models = result.unwrap();
+        assert!(!models.is_empty(), "Should return at least some models");
+    }
 
-        match result {
-            Ok(success) => {
-                assert!(success, "Download should return true on success");
-                println!("Successfully downloaded {}", model_identifier);
-            }
-            Err(e) => {
-                panic!("Download failed: {:?}", e);
-            }
-        }
+    #[test]
+    fn test_hf_list_tags() {
+        let settings = AppSettings::default();
+        let downloader =
+            HuggingFaceModelDownloader::new(settings).expect("Failed to create downloader");
+
+        // Use a known HuggingFace model with Ollama support
+        let model = "bartowski/Llama-3.2-1B-Instruct-GGUF";
+        let result = downloader.list_model_tags(model);
+
+        assert!(
+            result.is_ok(),
+            "list_model_tags should succeed for a valid model"
+        );
+        let tags = result.unwrap();
+        assert!(
+            !tags.is_empty(),
+            "Should return at least some tags for the model"
+        );
     }
 }
