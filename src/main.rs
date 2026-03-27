@@ -326,7 +326,7 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
     );
 
     settings.ollama_library.chunk_size_mib = prompt_u64_choice(
-        "Chunk size for large blob downloads (MiB)",
+        "Chunk size for large blob downloads (MiB -- 0 for no chunking)",
         settings.ollama_library.chunk_size_mib,
         &[0, 32, 64, 128, 256, 512],
     );
