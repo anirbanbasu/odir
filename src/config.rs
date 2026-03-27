@@ -20,6 +20,10 @@ pub enum HttpUrlParseError {
     /// URL scheme is not http or https.
     #[error("URL scheme should either be http or https, got: {0}")]
     InvalidScheme(String),
+
+    /// chunk_size_mib is not one of the allowed values.
+    #[error("chunk_size_mib must be one of [0, 32, 64, 128, 256, 512], got: {0}")]
+    InvalidChunkSizeMiB(u64),
 }
 
 pub fn validate_string_as_http_url(url_str: &str) -> Result<Url, HttpUrlParseError> {
@@ -75,6 +79,17 @@ pub struct OllamaLibrary {
 
     /// Timeout for HTTP requests in seconds.
     pub timeout: f64,
+
+    /// Size in MiB for each chunk when downloading large blobs in parts.
+    /// Must be one of [0, 32, 64, 128, 256, 512].
+    /// Set to 0 to disable chunked downloading and download blobs in one stream.
+    /// Default is 128 (128 MiB).
+    pub chunk_size_mib: u64,
+
+    /// Whether chunked downloads should run in parallel worker threads.
+    /// If false, chunked downloads run serially with one worker.
+    /// Default is true.
+    pub download_chunks_in_parallel: bool,
 }
 
 impl Default for OllamaLibrary {
@@ -85,6 +100,8 @@ impl Default for OllamaLibrary {
             library_base_url: "https://ollama.com/library/".to_string(),
             verify_ssl: true,
             timeout: 120.0,
+            chunk_size_mib: 128,
+            download_chunks_in_parallel: true,
         }
     }
 }
@@ -108,6 +125,12 @@ impl AppSettings {
         validate_string_as_http_url(&self.ollama_server.url)?;
         validate_string_as_http_url(&self.ollama_library.registry_base_url)?;
         validate_string_as_http_url(&self.ollama_library.library_base_url)?;
+        const VALID_CHUNK_SIZES_MB: &[u64] = &[0, 32, 64, 128, 256, 512];
+        if !VALID_CHUNK_SIZES_MB.contains(&self.ollama_library.chunk_size_mib) {
+            return Err(HttpUrlParseError::InvalidChunkSizeMiB(
+                self.ollama_library.chunk_size_mib,
+            ));
+        }
         Ok(())
     }
 
@@ -280,6 +303,26 @@ impl AppSettings {
             ollama_library.insert(
                 "timeout".to_string(),
                 Value::Number(serde_json::Number::from_f64(defaults.timeout).unwrap()),
+            );
+        }
+        if !ollama_library.contains_key("chunk_size_mib") {
+            warn!(
+                "Missing field 'ollama_library.chunk_size_mib', using default: {}",
+                defaults.chunk_size_mib
+            );
+            ollama_library.insert(
+                "chunk_size_mib".to_string(),
+                Value::Number(serde_json::Number::from(defaults.chunk_size_mib)),
+            );
+        }
+        if !ollama_library.contains_key("download_chunks_in_parallel") {
+            warn!(
+                "Missing field 'ollama_library.download_chunks_in_parallel', using default: {}",
+                defaults.download_chunks_in_parallel
+            );
+            ollama_library.insert(
+                "download_chunks_in_parallel".to_string(),
+                Value::Bool(defaults.download_chunks_in_parallel),
             );
         }
 
@@ -520,6 +563,7 @@ mod tests {
         assert_eq!(library.library_base_url, "https://ollama.com/library/");
         assert_eq!(library.verify_ssl, true);
         assert_eq!(library.timeout, 120.0);
+        assert!(library.download_chunks_in_parallel);
     }
 
     #[test]
@@ -656,6 +700,7 @@ mod tests {
         ); // default
         assert_eq!(settings.ollama_library.verify_ssl, true); // default
         assert_eq!(settings.ollama_library.timeout, 120.0); // default
+        assert!(settings.ollama_library.download_chunks_in_parallel); // default
 
         fs::remove_file(test_file).unwrap();
     }

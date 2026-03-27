@@ -19,6 +19,8 @@
 
 mod common;
 
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -114,6 +116,100 @@ fn test_hf_download_success() {
     );
 
     println!("Download completed successfully!");
+}
+
+/// Test downloading a larger HuggingFace model via CLI.
+///
+/// Model under test: `unsloth/gemma-3-270m-it-GGUF:Q4_K_S`
+///
+/// Note: Hugging Face currently does not support byte-range requests for this
+/// path in our workflow, so this test is expected to run in single-stream mode.
+///
+/// Run explicitly with:
+///
+/// ```bash
+/// RUN_INTEGRATION_TESTS=1 cargo test --test cli_hf_download test_hf_large_model_download_single_stream -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn test_hf_large_model_download_single_stream() {
+    if !common::should_run_integration_tests() {
+        println!("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.");
+        return;
+    }
+
+    println!("Testing larger HuggingFace model download (single-stream expected)...");
+
+    let model = "unsloth/gemma-3-270m-it-GGUF:Q4_K_S";
+    let mut child = common::spawn_odir(&["hf-model-download", model]);
+
+    println!("Spawned large-model download process, PID: {}", child.id());
+
+    let status = common::wait_with_timeout(&mut child, 1200) // 20 minutes timeout
+        .expect("Large-model download process did not complete within timeout");
+
+    println!("Process exited with status: {:?}", status);
+
+    assert!(
+        status.success(),
+        "Large HuggingFace download should exit successfully, but exited with: {:?}",
+        status
+    );
+
+    println!("Large HuggingFace model download completed successfully!");
+}
+
+/// Lightweight non-interactive check for download mode indicator in output.
+///
+/// This test starts the larger HF model download, lets it run briefly,
+/// terminates the process, and asserts that output indicates single-stream
+/// fallback behavior.
+#[test]
+#[ignore]
+fn test_hf_large_model_mode_indicator_non_interactive() {
+    if !common::should_run_integration_tests() {
+        println!("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.");
+        return;
+    }
+
+    println!("Testing HF mode indicator output (non-interactive)...");
+
+    let model = "unsloth/gemma-3-270m-it-GGUF:Q4_K_S";
+    let mut child = Command::new(common::get_binary_path())
+        .args(["hf-model-download", model])
+        .env("ODIR_LOG_LEVEL", "DEBUG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn odir process");
+
+    // Allow enough time for mode-detection logs to appear.
+    thread::sleep(Duration::from_secs(12));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+
+    let combined = format!("{}\n{}", stdout, stderr);
+    println!(
+        "Captured output (truncated): {}",
+        &combined.chars().take(2000).collect::<String>()
+    );
+
+    assert!(
+        combined.contains("falling back to single-stream download")
+            || combined.contains("Server does not support byte-range probe"),
+        "Expected single-stream fallback indicator in output, but none was found"
+    );
 }
 
 /// Test that invalid model identifiers are handled correctly
