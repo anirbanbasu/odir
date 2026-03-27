@@ -74,14 +74,14 @@ export RUN_INTEGRATION_TESTS := "1"
 
 # Run comprehensive tests, including downloading models
 test-comprehensive $RUN_INTEGRATION_TESTS="1":
-    @echo "Running all tests, including downloading models..."
-    @cargo test -- --include-ignored
+    @echo "Running all tests, including downloading models, with --test-threads=1 to avoid shared-state conflicts in integration downloads..."
+    @cargo test -- --include-ignored --test-threads=1
     @echo "All tests complete."
 
 # Generate comprehensive test coverage report (including integration tests) and show in browser
 coverage-comprehensive-and-show-in-browser $RUN_INTEGRATION_TESTS="1":
-    @echo "Generating comprehensive test coverage report (including integration tests) and opening it in browser..."
-    @cargo llvm-cov --all-targets --html --open -- --include-ignored
+    @echo "Generating comprehensive test coverage report (including integration tests) with --test-threads=1 for stable integration coverage, and opening it in browser..."
+    @cargo llvm-cov --all-targets --html --open -- --include-ignored --test-threads=1
     @echo "Comprehensive coverage report generated and opened in browser."
 
 # Run tests

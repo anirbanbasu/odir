@@ -2,7 +2,7 @@
 //! including model presence checks, downloading blobs, saving manifests,
 //! and cleaning up temporary files.
 use crate::downloader::model_downloader::{DownloaderError, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{debug, error, info, warn};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -343,6 +343,13 @@ fn log_single_stream_fallback(range_supported: bool, total_size: u64, named_dige
     }
 }
 
+fn new_progress_bar(total_size: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total_size);
+    // Draw progress on stdout; env_logger writes to stderr, keeping the two streams separate.
+    pb.set_draw_target(ProgressDrawTarget::stdout());
+    pb
+}
+
 fn download_model_blob_single_stream(
     client: &Client,
     url: &str,
@@ -365,7 +372,7 @@ fn download_model_blob_single_stream(
 
     let total_size = response.content_length().unwrap_or(0);
 
-    let pb = ProgressBar::new(total_size);
+    let pb = new_progress_bar(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -584,7 +591,7 @@ fn download_model_blob_chunked(request: ChunkedBlobDownload<'_>) -> Result<(Path
     log_scan_summary(named_digest, num_parts, &scan);
 
     // Progress bar covering the full file, pre-advanced for already-downloaded bytes.
-    let pb = ProgressBar::new(total_size);
+    let pb = new_progress_bar(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -864,6 +871,11 @@ struct DownloadChunksParallelRequest<'a> {
     download_chunks_in_parallel: bool,
 }
 
+enum ChunkCoordinatorEvent {
+    PartDone(u64),
+    DebugLine(String),
+}
+
 /// Checks signal-handler interrupt flags and, if warranted, prompts the user.
 /// Stores `true` into `cancel` and returns `true` when the coordinator should abort.
 fn check_chunk_interrupt(cancel: &AtomicBool, pb: &ProgressBar, parts_done: &AtomicU64) -> bool {
@@ -937,7 +949,7 @@ fn update_chunk_progress(
 }
 
 struct CoordinatorLoopParams<'a> {
-    done_rx: &'a mpsc::Receiver<u64>,
+    done_rx: &'a mpsc::Receiver<ChunkCoordinatorEvent>,
     cancel: &'a AtomicBool,
     first_error: &'a Mutex<Option<DownloaderError>>,
     bytes_done: &'a AtomicU64,
@@ -977,7 +989,7 @@ fn run_coordinator_loop(p: CoordinatorLoopParams<'_>) -> (bool, usize) {
         }
 
         match p.done_rx.recv_timeout(refresh_interval) {
-            Ok(part_idx) => {
+            Ok(ChunkCoordinatorEvent::PartDone(part_idx)) => {
                 if on_chunk_completed(
                     part_idx,
                     p.state,
@@ -989,6 +1001,11 @@ fn run_coordinator_loop(p: CoordinatorLoopParams<'_>) -> (bool, usize) {
                 ) {
                     break;
                 }
+            }
+            Ok(ChunkCoordinatorEvent::DebugLine(line)) => {
+                // pb.println() prints a stable line above the live progress bar
+                // without corrupting its redraw cycle.
+                p.pb.println(line);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1041,7 +1058,7 @@ fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) 
     let parts_done = Arc::new(AtomicU64::new(completed_parts));
     let cancel = Arc::new(AtomicBool::new(false));
     let first_error = Arc::new(Mutex::new(None::<DownloaderError>));
-    let (done_tx, done_rx) = mpsc::channel::<u64>();
+    let (done_tx, done_rx) = mpsc::channel::<ChunkCoordinatorEvent>();
 
     let mut user_aborted = false;
     let mut finished_missing: usize = 0;
@@ -1116,7 +1133,7 @@ struct ChunkWorker<'a> {
     parts_done: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     first_error: Arc<Mutex<Option<DownloaderError>>>,
-    done_tx: mpsc::Sender<u64>,
+    done_tx: mpsc::Sender<ChunkCoordinatorEvent>,
     num_parts: u64,
     chunk_size: u64,
     total_size: u64,
@@ -1141,7 +1158,7 @@ impl ChunkWorker<'_> {
             match self.download_one_part(part_idx) {
                 Ok(()) => {
                     self.parts_done.fetch_add(1, Ordering::AcqRel);
-                    let _ = self.done_tx.send(part_idx);
+                    let _ = self.done_tx.send(ChunkCoordinatorEvent::PartDone(part_idx));
                 }
                 Err(e) => {
                     self.set_error_once(e);
@@ -1179,6 +1196,33 @@ impl ChunkWorker<'_> {
                 self.named_digest,
                 response.status()
             )));
+        }
+
+        // Log HTTP status and headers at debug level
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        // Log HTTP status and headers at debug level via the coordinator's
+        // pb.println() path so the message appears cleanly above the progress bar.
+        if log::log_enabled!(log::Level::Info) {
+            let debug_line = format!(
+                "[Part {}/{}] GET {} (Content-Type: {}, Content-Length: {})",
+                part_idx + 1,
+                self.num_parts,
+                response.status(),
+                content_type,
+                content_length
+            );
+            let _ = self
+                .done_tx
+                .send(ChunkCoordinatorEvent::DebugLine(debug_line));
         }
 
         let mut out = fs::OpenOptions::new()
@@ -1228,7 +1272,7 @@ fn compute_file_sha256(path: &Path, named_digest: &str) -> Result<String> {
 
     info!("Verifying downloaded BLOB {}", named_digest);
 
-    let pb = ProgressBar::new(total_size);
+    let pb = new_progress_bar(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -1270,6 +1314,37 @@ fn cleanup_chunk_workspace(workspace: &ChunkedWorkspace) {
     }
 }
 
+/// Clean up corrupted partial download files when digest verification fails.
+/// Removes the `.parts/<digest>.bin` and `.parts/<digest>.state.json` files
+/// so the next retry can start fresh.
+fn cleanup_corrupted_partial_files(blobs_dir: &Path, named_digest: &str) {
+    let parts_root = blobs_dir.join(".parts");
+    if !parts_root.exists() {
+        return;
+    }
+
+    let stem = digest_fs_name(named_digest);
+    let data_file = parts_root.join(format!("{}.bin", stem));
+    let state_file = parts_root.join(format!("{}.state.json", stem));
+
+    if let Err(e) = fs::remove_file(&data_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove corrupted partial blob file {:?}: {}",
+            data_file, e
+        );
+    }
+    if let Err(e) = fs::remove_file(&state_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove partial state file {:?}: {}",
+            state_file, e
+        );
+    }
+}
+
 // ─── Blob / manifest persistence ─────────────────────────────────────────────
 
 pub fn save_blob(
@@ -1287,6 +1362,27 @@ pub fn save_blob(
             "Digest mismatch: expected {}, got {}",
             expected_digest, computed_digest
         );
+
+        // Clean up corrupted partial files so next retry starts fresh
+        let models_path = match expand_models_path(models_path) {
+            Ok(path) => path,
+            Err(_) => {
+                // If we can't expand path, we still need to fail, but we can't clean up
+                return Err(DownloaderError::Other(format!(
+                    "Digest mismatch for {}",
+                    named_digest
+                )));
+            }
+        };
+        let blobs_dir = models_path.join("blobs");
+        if blobs_dir.exists() {
+            cleanup_corrupted_partial_files(&blobs_dir, named_digest);
+            info!(
+                "Cleaned up corrupted partial files for {}; next retry will start fresh",
+                named_digest
+            );
+        }
+
         return Err(DownloaderError::Other(format!(
             "Digest mismatch for {}",
             named_digest
