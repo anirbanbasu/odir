@@ -6,7 +6,8 @@ Make model download resume robust across multi-layer failures by persisting veri
 
 ## Out of Scope
 
-- No CLI command surface changes in this plan.
+- No broad CLI command surface changes in this plan.
+- One exception: add a single read-only `journal` command with optional `--json` output.
 - No README updates in this plan.
 
 ## Architecture Decisions
@@ -108,11 +109,13 @@ Suggested schema:
 Tasks:
 
 - Define serde structs for journal documents.
-- Add deterministic on-disk path for journals under models path.
+- Add deterministic on-disk path for journals under ODIR app state (not Ollama models path).
+- Use JSON as the journal format for consistency with existing serde_json usage.
 
 Acceptance:
 
 - Journal can be parsed and written atomically.
+- Journal location is source-agnostic and shared by Ollama and HF flows.
 
 ### 2.2 Journal lifecycle and reconciliation
 
@@ -154,6 +157,28 @@ Tasks:
 Acceptance:
 
 - Journal cannot leave partial writes that break reruns.
+
+### 2.4 Read-only journal CLI
+
+- Add one read-only command to inspect journal state.
+
+Files:
+
+- src/main.rs
+- src/downloader/utils.rs
+- src/downloader/manifest.rs
+
+Tasks:
+
+- Add `journal` command with no subcommands (single-purpose view command).
+- Support default user-friendly output and optional `--json` machine-readable output.
+- Do not add any command to edit, mutate, or delete journal entries.
+- On malformed journal, display a clear message and continue with filesystem-reconciled behavior.
+
+Acceptance:
+
+- Users can inspect journal progress and failure reasons without manual file inspection.
+- Journal remains an internal advisory state; manual editing is unsupported and unnecessary.
 
 ## Phase 3: Cleanup Policy for Transient Artifacts
 
