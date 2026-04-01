@@ -221,10 +221,21 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         let manifest: ImageManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| DownloaderError::ParseError(format!("Failed to parse manifest: {}", e)))?;
 
+        let layer_count = manifest.layers.as_ref().map_or(0, |layers| layers.len());
+        let total_download_units = 1 + layer_count;
+        println!(
+            "Model has {} downloadable item(s): 1 config + {} layer(s)",
+            total_download_units, layer_count
+        );
+
         // Track files to be saved (source_path, named_digest, computed_digest)
         let mut files_to_be_copied: Vec<(PathBuf, String, String)> = Vec::new();
 
         // Download model configuration BLOB
+        println!(
+            "Downloading item 1/{} (config): {}",
+            total_download_units, manifest.config.digest
+        );
         info!("Downloading model configuration {}", manifest.config.digest);
         let (file_model_config, digest_model_config) =
             match self_mut.download_blob_for_model(&model_repo, &manifest.config.digest) {
@@ -240,13 +251,20 @@ impl ModelDownloader for HuggingFaceModelDownloader {
             manifest.config.digest.clone(),
             digest_model_config,
         ));
+        println!("Completed item 1/{}", total_download_units);
 
         // Download layers if present
         if let Some(layers) = &manifest.layers {
-            for layer in layers {
+            for (idx, layer) in layers.iter().enumerate() {
                 debug!(
                     "Layer: {}, Size: {} bytes, Digest: {}",
                     layer.media_type, layer.size, layer.digest
+                );
+
+                let layer_position = idx + 2; // 1 is config
+                println!(
+                    "Downloading item {}/{} ({} layer): {}",
+                    layer_position, total_download_units, layer.media_type, layer.digest
                 );
 
                 // Check for interruption between layer downloads
@@ -276,6 +294,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
                         }
                     };
                 files_to_be_copied.push((file_layer, layer.digest.clone(), digest_layer));
+                println!("Completed item {}/{}", layer_position, total_download_units);
             }
         }
 
