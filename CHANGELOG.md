@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ### Changed
 
-- None documented yet.
+- The default HTTP user-agent now includes normalized architecture and operating system names, for example `odir/0.1.1 (arm64 darwin)`.
 
 ### Deprecated
 
@@ -25,7 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ### Fixed
 
-- None documented yet.
+- Added `OD_UA` environment variable support to override the HTTP user-agent used by ODIR.
 
 ### Security
 

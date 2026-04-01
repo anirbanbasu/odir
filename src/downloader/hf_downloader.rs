@@ -1,5 +1,5 @@
 //! Downloader implementation for Hugging Face Ollama compatible models.
-use crate::config::AppSettings;
+use crate::config::{AppSettings, get_user_agent};
 use crate::downloader::http_client::build_registry_client;
 use crate::downloader::manifest::ImageManifest;
 use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};
@@ -51,9 +51,7 @@ impl HuggingFaceModelDownloader {
     /// # Returns
     /// * `Result<Self>` - New downloader instance or error
     pub fn new(settings: AppSettings) -> Result<Self> {
-        let pkg_version = env!("CARGO_PKG_VERSION");
-        let os_info = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-        let user_agent = format!("odir/{} ({})", pkg_version, os_info);
+        let user_agent = get_user_agent();
 
         let client = build_registry_client(&user_agent, &settings.ollama_library)?;
 

@@ -461,19 +461,54 @@ fn settings_path_or_panic(result: Result<PathBuf, io::Error>) -> PathBuf {
 
 /// Get the user agent string for HTTP requests.
 ///
-/// Returns a string in the format "odir/{version}".
+/// Returns the `OD_UA` override when set; otherwise returns a string in the
+/// format `odir/{version} ({arch} {os})` using Ollama-compatible lower-case
+/// platform names.
 ///
 /// # Returns
 /// * `String` - User agent string
 pub fn get_user_agent() -> String {
-    format!("odir/{}", env!("CARGO_PKG_VERSION"))
+    if let Ok(user_agent) = env::var("OD_UA") {
+        let trimmed = user_agent.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    format!(
+        "odir/{} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        get_native_arch_name(),
+        get_native_os_name()
+    )
+}
+
+fn get_native_os_name() -> &'static str {
+    match env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn get_native_arch_name() -> &'static str {
+    match env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Initialize logger for tests to enable log coverage
     fn init_test_logger() {
@@ -505,6 +540,59 @@ mod tests {
     fn test_get_user_agent() {
         let user_agent = get_user_agent();
         assert!(user_agent.starts_with("odir/"));
+        assert!(user_agent.contains(" ("));
+        assert!(user_agent.ends_with(&format!(" {})", get_native_os_name())));
+    }
+
+    #[test]
+    fn test_get_native_platform_names() {
+        assert_eq!(get_native_os_name(), expected_os_name(env::consts::OS));
+        assert_eq!(
+            get_native_arch_name(),
+            expected_arch_name(env::consts::ARCH)
+        );
+    }
+
+    #[test]
+    fn test_get_user_agent_uses_od_ua_override() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("OD_UA");
+        }
+
+        let default_user_agent = get_user_agent();
+        assert!(default_user_agent.starts_with("odir/"));
+
+        unsafe {
+            env::set_var("OD_UA", "odir/v0.1.1 (arm64 darwin)");
+        }
+
+        assert_eq!(get_user_agent(), "odir/v0.1.1 (arm64 darwin)");
+
+        unsafe {
+            env::set_var("OD_UA", "   ");
+        }
+
+        assert_eq!(get_user_agent(), default_user_agent);
+
+        unsafe {
+            env::remove_var("OD_UA");
+        }
+    }
+
+    fn expected_os_name(os: &str) -> &str {
+        match os {
+            "macos" => "darwin",
+            other => other,
+        }
+    }
+
+    fn expected_arch_name(arch: &str) -> &str {
+        match arch {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            other => other,
+        }
     }
 
     #[test]

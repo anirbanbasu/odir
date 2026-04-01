@@ -99,8 +99,9 @@ The environment variable(s), listed below, are _optional_. If not specified, the
 | Variable  | Description and default value(s)                                     |
 |-----------|----------------------------------------------------------------------|
 | `ODIR_LOG_LEVEL` or `OD_LOG_LEVEL` | The level to be set for the logger. Default value is `INFO`. See all valid values in [Rust logging documentation](https://docs.rs/log/latest/log/enum.Level.html). The level specification can be set to `OFF`, which turns off logging completely.|
+| `OD_UA` | Overrides the HTTP User-Agent string used by ODIR. By default, ODIR uses `odir/<version> (<arch> <os>)` with lower-case, Ollama-compatible platform names such as `amd64 linux` or `arm64 darwin`. |
 
-_Note that the environment variable `ODIR_LOG_LEVEL` takes precedence over `OD_LOG_LEVEL` if both are set. Also note that in the original Ollama Downloader, it was possible to specify `OD_SETTINGS_FILE` and `OD_UA_NAME_VER` as [environment variables](https://github.com/anirbanbasu/ollama-downloader?tab=readme-ov-file#environment-variables), but those are no longer supported in ODIR. Instead, the default values for these are the user-specific settings file location for the operating system; and `odir/<app-version>`_.
+_Note that the environment variable `ODIR_LOG_LEVEL` takes precedence over `OD_LOG_LEVEL` if both are set. Also note that in the original Ollama Downloader, it was possible to specify `OD_SETTINGS_FILE` as an [environment variable](https://github.com/anirbanbasu/ollama-downloader?tab=readme-ov-file#environment-variables), but that is no longer supported in ODIR. Instead, the default value is the user-specific settings file location for the operating system._
 
 ## Usage
 
