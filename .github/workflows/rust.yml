@@ -41,7 +41,7 @@ jobs:
               run: cargo build --verbose
             - name: Setup Ollama
               # Ollama is required for model download tests, which are set to be ignored by default
-              uses: ai-action/setup-ollama@7afb44375b8f40813ee2dac11e391fe55e3713ce # v2.0.24
+              uses: ai-action/setup-ollama@8dace3eab22ce4d761427bb75f8f70f1270ea660 # v2.0.25
             - name: Run tests
               # Include ignored tests, which include model download tests
               run: RUN_INTEGRATION_TESTS=1 cargo test --verbose -- --include-ignored
