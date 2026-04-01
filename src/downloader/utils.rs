@@ -1,7 +1,9 @@
 //! Utility functions for the Ollama Downloader in Rust (ODIR),
 //! including model presence checks, downloading blobs, saving manifests,
 //! and cleaning up temporary files.
-use crate::downloader::model_downloader::{DownloaderError, Result};
+use crate::downloader::model_downloader::{
+    DownloaderError, Result, http_status_error_from_response,
+};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{debug, error, info, warn};
 use reqwest::StatusCode;
@@ -45,9 +47,7 @@ pub fn is_model_present_in_ollama(
     let response = client.get(&tags_url).send()?;
 
     if !response.status().is_success() {
-        return Err(DownloaderError::HttpError(
-            response.error_for_status().unwrap_err(),
-        ));
+        return Err(http_status_error_from_response(response));
     }
 
     let tags_response: Value = response.json()?;
@@ -365,9 +365,7 @@ fn download_model_blob_single_stream(
     let response = client.get(url).send()?;
 
     if !response.status().is_success() {
-        return Err(DownloaderError::HttpError(
-            response.error_for_status().unwrap_err(),
-        ));
+        return Err(http_status_error_from_response(response));
     }
 
     let total_size = response.content_length().unwrap_or(0);

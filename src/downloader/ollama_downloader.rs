@@ -2,7 +2,9 @@
 use crate::config::{AppSettings, get_user_agent};
 use crate::downloader::http_client::build_registry_client;
 use crate::downloader::manifest::ImageManifest;
-use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};
+use crate::downloader::model_downloader::{
+    DownloaderError, ModelDownloader, Result, http_status_error_from_response,
+};
 use crate::downloader::utils::{
     BlobDownloadRequest, Ownership, cleanup_unnecessary_files, download_model_blob,
     expand_models_path, infer_models_dir_ownership, is_model_present_in_ollama, save_blob,
@@ -65,9 +67,7 @@ impl OllamaModelDownloader {
         let response = self.client.get(&url).send()?;
 
         if !response.status().is_success() {
-            return Err(DownloaderError::HttpError(
-                response.error_for_status().unwrap_err(),
-            ));
+            return Err(http_status_error_from_response(response));
         }
 
         Ok(response.text()?)
@@ -358,9 +358,7 @@ impl ModelDownloader for OllamaModelDownloader {
             .send()?;
 
         if !response.status().is_success() {
-            return Err(DownloaderError::HttpError(
-                response.error_for_status().unwrap_err(),
-            ));
+            return Err(http_status_error_from_response(response));
         }
 
         let html_content = response.text()?;
@@ -437,9 +435,7 @@ impl ModelDownloader for OllamaModelDownloader {
         let response = self.client.get(&tags_url).send()?;
 
         if !response.status().is_success() {
-            return Err(DownloaderError::HttpError(
-                response.error_for_status().unwrap_err(),
-            ));
+            return Err(http_status_error_from_response(response));
         }
 
         let html_content = response.text()?;

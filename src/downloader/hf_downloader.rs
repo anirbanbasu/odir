@@ -2,7 +2,9 @@
 use crate::config::{AppSettings, get_user_agent};
 use crate::downloader::http_client::build_registry_client;
 use crate::downloader::manifest::ImageManifest;
-use crate::downloader::model_downloader::{DownloaderError, ModelDownloader, Result};
+use crate::downloader::model_downloader::{
+    DownloaderError, ModelDownloader, Result, http_status_error_from_response,
+};
 use crate::downloader::utils::{
     BlobDownloadRequest, Ownership, cleanup_unnecessary_files, download_model_blob,
     expand_models_path, infer_models_dir_ownership, is_model_present_in_ollama, save_blob,
@@ -82,9 +84,7 @@ impl HuggingFaceModelDownloader {
         let response = self.client.get(&url).send()?;
 
         if !response.status().is_success() {
-            return Err(DownloaderError::HttpError(
-                response.error_for_status().unwrap_err(),
-            ));
+            return Err(http_status_error_from_response(response));
         }
 
         Ok(response.text()?)
@@ -402,9 +402,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
             let response = self.client.head(&url).send()?;
 
             if !response.status().is_success() {
-                return Err(DownloaderError::HttpError(
-                    response.error_for_status().unwrap_err(),
-                ));
+                return Err(http_status_error_from_response(response));
             }
 
             // Extract next page URL from Link header
@@ -447,9 +445,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         let response = self.client.get(&final_url).send()?;
 
         if !response.status().is_success() {
-            return Err(DownloaderError::HttpError(
-                response.error_for_status().unwrap_err(),
-            ));
+            return Err(http_status_error_from_response(response));
         }
 
         let models: Vec<HfModel> = response.json()?;
@@ -477,9 +473,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         let response = self.client.get(&api_url).send()?;
 
         if !response.status().is_success() {
-            return Err(DownloaderError::HttpError(
-                response.error_for_status().unwrap_err(),
-            ));
+            return Err(http_status_error_from_response(response));
         }
 
         let model_info: HfModelInfo = response.json()?;

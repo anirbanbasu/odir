@@ -9,5 +9,5 @@ pub mod ollama_downloader;
 pub mod utils;
 
 pub use hf_downloader::HuggingFaceModelDownloader;
-pub use model_downloader::ModelDownloader;
+pub use model_downloader::{DownloaderError, ModelDownloader};
 pub use ollama_downloader::OllamaModelDownloader;
