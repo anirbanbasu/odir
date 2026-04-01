@@ -52,3 +52,52 @@ pub struct ImageManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layers: Option<Vec<ImageManifestLayerEntry>>,
 }
+
+/// Supported source types for model downloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadSourceType {
+    Ollama,
+    Hf,
+}
+
+/// Per-item download state persisted in the advisory download journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JournalItemState {
+    Pending,
+    Completed,
+    Failed,
+}
+
+/// One digest entry tracked in the advisory download journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadJournalItem {
+    pub digest: String,
+    pub media_type: String,
+    pub size: u64,
+    pub state: JournalItemState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Advisory journal for a specific model download.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadJournal {
+    pub model_identifier: String,
+    pub source_type: DownloadSourceType,
+    pub tag_or_quant: String,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub items: Vec<DownloadJournalItem>,
+}
+
+/// Compact journal metadata used by list output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadJournalListEntry {
+    pub model_identifier: String,
+    pub source_type: DownloadSourceType,
+    pub tag_or_quant: String,
+    pub updated_at: u64,
+    pub item_count: usize,
+}

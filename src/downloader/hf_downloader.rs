@@ -2,19 +2,23 @@
 use crate::config::{AppSettings, get_user_agent};
 use crate::downloader::http_client::build_registry_client;
 use crate::downloader::manifest::ImageManifest;
+use crate::downloader::manifest::{DownloadJournalItem, DownloadSourceType, JournalItemState};
 use crate::downloader::model_downloader::{
     DownloaderError, ModelDownloader, Result, http_status_error_from_response,
 };
 use crate::downloader::utils::{
-    BlobDownloadRequest, Ownership, cleanup_unnecessary_files, download_model_blob,
-    expand_models_path, infer_models_dir_ownership, is_model_present_in_ollama, save_blob,
-    save_manifest, warn_if_models_path_requires_root,
+    BlobDownloadRequest, Ownership, blob_path_from_digest, cleanup_stale_transient_artifacts,
+    cleanup_unnecessary_files, download_model_blob, expand_models_path, infer_models_dir_ownership,
+    initialize_or_reconcile_journal, is_model_present_in_ollama, remove_blob_if_invalid, save_blob,
+    save_manifest, update_journal_item_state, verify_blob_file_digest,
+    warn_if_models_path_requires_root, write_journal_atomic,
 };
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const HF_BASE_URL: &str = "https://hf.co/v2/";
@@ -175,6 +179,10 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         // Warn about ownership issues before attempting download
         warn_if_models_path_requires_root(&self.settings.ollama_library.models_path, true);
 
+        if let Err(e) = cleanup_stale_transient_artifacts(&self.settings) {
+            warn!("Transient cleanup failed at downloader start: {}", e);
+        }
+
         let (model_repo, quant) = if model_identifier.contains(':') {
             let parts: Vec<&str> = model_identifier.split(':').collect();
             (parts[0].to_string(), parts[1].to_string())
@@ -221,92 +229,180 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         let manifest: ImageManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| DownloaderError::ParseError(format!("Failed to parse manifest: {}", e)))?;
 
-        let layer_count = manifest.layers.as_ref().map_or(0, |layers| layers.len());
-        let total_download_units = 1 + layer_count;
+        let mut download_items: Vec<DownloadJournalItem> = vec![DownloadJournalItem {
+            digest: manifest.config.digest.clone(),
+            media_type: manifest.config.media_type.clone(),
+            size: manifest.config.size,
+            state: JournalItemState::Pending,
+            last_error: None,
+        }];
+        if let Some(layers) = &manifest.layers {
+            download_items.extend(layers.iter().map(|layer| DownloadJournalItem {
+                digest: layer.digest.clone(),
+                media_type: layer.media_type.clone(),
+                size: layer.size,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }));
+        }
+
+        let total_download_units = download_items.len();
+        let layer_count = total_download_units.saturating_sub(1);
         println!(
             "Model has {} downloadable item(s): 1 config + {} layer(s)",
             total_download_units, layer_count
         );
 
-        // Track files to be saved (source_path, named_digest, computed_digest)
-        let mut files_to_be_copied: Vec<(PathBuf, String, String)> = Vec::new();
+        let (journal_path, mut journal) = match initialize_or_reconcile_journal(
+            DownloadSourceType::Hf,
+            model_identifier,
+            &quant,
+            download_items,
+            &self.settings.ollama_library.models_path,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to initialize journal: {}", e);
+                self_mut.cleanup_unnecessary_files();
+                return Err(e);
+            }
+        };
 
-        // Download model configuration BLOB
-        println!(
-            "Downloading item 1/{} (config): {}",
-            total_download_units, manifest.config.digest
-        );
-        info!("Downloading model configuration {}", manifest.config.digest);
-        let (file_model_config, digest_model_config) =
-            match self_mut.download_blob_for_model(&model_repo, &manifest.config.digest) {
-                Ok(result) => result,
+        let mut committed_blobs: Vec<PathBuf> = Vec::new();
+        for (idx, item) in journal.items.clone().iter().enumerate() {
+            struct ItemProgressGuard;
+            impl Drop for ItemProgressGuard {
+                fn drop(&mut self) {
+                    crate::signal_handler::set_progress_active(false);
+                }
+            }
+            crate::signal_handler::set_progress_active(true);
+            let _item_progress_guard = ItemProgressGuard;
+
+            let item_position = idx + 1;
+
+            if crate::signal_handler::is_interrupted()
+                || crate::signal_handler::confirm_pending_interrupt()
+            {
+                let err = DownloaderError::Other("Download interrupted by user".to_string());
+                update_journal_item_state(
+                    &mut journal,
+                    &item.digest,
+                    JournalItemState::Failed,
+                    Some("Interrupted by user".to_string()),
+                );
+                let _ = write_journal_atomic(&journal_path, &journal);
+                self_mut.cleanup_unnecessary_files();
+                return Err(err);
+            }
+
+            let blob_path = match blob_path_from_digest(
+                &self.settings.ollama_library.models_path,
+                &item.digest,
+            ) {
+                Ok(path) => path,
                 Err(e) => {
-                    error!("Failed to download model configuration: {}", e);
+                    update_journal_item_state(
+                        &mut journal,
+                        &item.digest,
+                        JournalItemState::Failed,
+                        Some(e.to_string()),
+                    );
+                    let _ = write_journal_atomic(&journal_path, &journal);
                     self_mut.cleanup_unnecessary_files();
                     return Err(e);
                 }
             };
-        files_to_be_copied.push((
-            file_model_config,
-            manifest.config.digest.clone(),
-            digest_model_config,
-        ));
-        println!("Completed item 1/{}", total_download_units);
 
-        // Download layers if present
-        if let Some(layers) = &manifest.layers {
-            for (idx, layer) in layers.iter().enumerate() {
-                debug!(
-                    "Layer: {}, Size: {} bytes, Digest: {}",
-                    layer.media_type, layer.size, layer.digest
-                );
-
-                let layer_position = idx + 2; // 1 is config
+            if blob_path.exists() {
                 println!(
-                    "Downloading item {}/{} ({} layer): {}",
-                    layer_position, total_download_units, layer.media_type, layer.digest
+                    "Verifying existing item {}/{} ({}): {}",
+                    item_position, total_download_units, item.media_type, item.digest
                 );
-
-                // Check for interruption between layer downloads
-                if crate::signal_handler::is_interrupted() {
-                    warn!("Download interrupted during layer download");
-                    self_mut.cleanup_unnecessary_files();
-                    return Err(DownloaderError::Other(
-                        "Download interrupted by user".to_string(),
-                    ));
+                let _ = std::io::stdout().flush();
+                match verify_blob_file_digest(&blob_path, &item.digest) {
+                    Ok(true) => {
+                        println!(
+                            "Skipping item {}/{}: already present and verified ({})",
+                            item_position, total_download_units, item.digest
+                        );
+                        update_journal_item_state(
+                            &mut journal,
+                            &item.digest,
+                            JournalItemState::Completed,
+                            None,
+                        );
+                        let _ = write_journal_atomic(&journal_path, &journal);
+                        continue;
+                    }
+                    Ok(false) => {
+                        let _ = remove_blob_if_invalid(
+                            &self.settings.ollama_library.models_path,
+                            &item.digest,
+                        );
+                    }
+                    Err(e) => {
+                        update_journal_item_state(
+                            &mut journal,
+                            &item.digest,
+                            JournalItemState::Failed,
+                            Some(e.to_string()),
+                        );
+                        let _ = write_journal_atomic(&journal_path, &journal);
+                        self_mut.cleanup_unnecessary_files();
+                        return Err(e);
+                    }
                 }
-                if crate::signal_handler::confirm_pending_interrupt() {
-                    warn!("Download interrupted during layer download");
-                    self_mut.cleanup_unnecessary_files();
-                    return Err(DownloaderError::Other(
-                        "Download interrupted by user".to_string(),
-                    ));
-                }
-
-                info!("Downloading {} layer {}", layer.media_type, layer.digest);
-                let (file_layer, digest_layer) =
-                    match self_mut.download_blob_for_model(&model_repo, &layer.digest) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            error!("Failed to download layer {}: {}", layer.digest, e);
-                            self_mut.cleanup_unnecessary_files();
-                            return Err(e);
-                        }
-                    };
-                files_to_be_copied.push((file_layer, layer.digest.clone(), digest_layer));
-                println!("Completed item {}/{}", layer_position, total_download_units);
             }
-        }
 
-        // All BLOBs downloaded, now save them
-        for (source, named_digest, computed_digest) in files_to_be_copied {
-            match self_mut.persist_blob(&source, &named_digest, &computed_digest) {
-                Ok(_) => {
-                    // Cleanup source file
+            println!(
+                "Downloading item {}/{} ({}): {}",
+                item_position, total_download_units, item.media_type, item.digest
+            );
+
+            info!("Downloading {} item {}", item.media_type, item.digest);
+            let (source, computed_digest) =
+                match self_mut.download_blob_for_model(&model_repo, &item.digest) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        update_journal_item_state(
+                            &mut journal,
+                            &item.digest,
+                            JournalItemState::Failed,
+                            Some(e.to_string()),
+                        );
+                        let _ = write_journal_atomic(&journal_path, &journal);
+                        self_mut.cleanup_unnecessary_files();
+                        return Err(e);
+                    }
+                };
+
+            match self_mut.persist_blob(&source, &item.digest, &computed_digest) {
+                Ok(target) => {
+                    committed_blobs.push(target);
                     let _ = fs::remove_file(&source);
+                    update_journal_item_state(
+                        &mut journal,
+                        &item.digest,
+                        JournalItemState::Completed,
+                        None,
+                    );
+                    let _ = write_journal_atomic(&journal_path, &journal);
+                    println!("Completed item {}/{}", item_position, total_download_units);
                 }
                 Err(e) => {
-                    error!("Failed to save BLOB {}: {}", named_digest, e);
+                    update_journal_item_state(
+                        &mut journal,
+                        &item.digest,
+                        JournalItemState::Failed,
+                        Some(e.to_string()),
+                    );
+                    let _ = write_journal_atomic(&journal_path, &journal);
+                    if !self.settings.ollama_server.keep_verified_blobs_on_error {
+                        for path in committed_blobs {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
                     self_mut.cleanup_unnecessary_files();
                     return Err(e);
                 }
@@ -318,7 +414,14 @@ impl ModelDownloader for HuggingFaceModelDownloader {
             Ok(_) => {}
             Err(e) => {
                 error!("Failed to save manifest: {}", e);
-                if self.settings.ollama_server.remove_downloaded_on_error {
+                if !self.settings.ollama_server.keep_verified_blobs_on_error {
+                    for path in committed_blobs {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+                if self.settings.ollama_server.remove_downloaded_on_error
+                    || !self.settings.ollama_server.keep_verified_blobs_on_error
+                {
                     self_mut.cleanup_unnecessary_files();
                 }
                 return Err(e);
@@ -348,6 +451,11 @@ impl ModelDownloader for HuggingFaceModelDownloader {
                 Ok(present) => present,
                 Err(e) => {
                     error!("Failed to verify model with Ollama server: {}", e);
+                    if !self.settings.ollama_server.keep_verified_blobs_on_error {
+                        for path in &committed_blobs {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
                     if self.settings.ollama_server.remove_downloaded_on_error {
                         info!("Removing downloaded files due to verification failure");
                         self_mut.cleanup_unnecessary_files();
@@ -362,6 +470,11 @@ impl ModelDownloader for HuggingFaceModelDownloader {
                     model_name
                 );
                 error!("{}", err_msg);
+                if !self.settings.ollama_server.keep_verified_blobs_on_error {
+                    for path in &committed_blobs {
+                        let _ = fs::remove_file(path);
+                    }
+                }
                 if self.settings.ollama_server.remove_downloaded_on_error {
                     info!("Removing downloaded files because model not found in Ollama server");
                     self_mut.cleanup_unnecessary_files();
@@ -376,6 +489,10 @@ impl ModelDownloader for HuggingFaceModelDownloader {
 
         // Clear unnecessary files list on success
         self_mut.unnecessary_files.clear();
+
+        if let Err(e) = cleanup_stale_transient_artifacts(&self.settings) {
+            warn!("Transient cleanup failed at downloader end: {}", e);
+        }
 
         println!(
             "HuggingFace model {} successfully downloaded",

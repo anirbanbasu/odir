@@ -49,6 +49,10 @@ pub struct OllamaServer {
 
     /// Whether to check if the model is present in the Ollama server after downloading.
     pub check_model_presence: bool,
+
+    /// Whether verified blobs should be kept on error.
+    /// If false, strict all-or-nothing rollback is used.
+    pub keep_verified_blobs_on_error: bool,
 }
 
 impl Default for OllamaServer {
@@ -58,6 +62,7 @@ impl Default for OllamaServer {
             api_key: None,
             remove_downloaded_on_error: true,
             check_model_presence: true,
+            keep_verified_blobs_on_error: true,
         }
     }
 }
@@ -90,6 +95,18 @@ pub struct OllamaLibrary {
     /// If false, chunked downloads run serially with one worker.
     /// Default is true.
     pub download_chunks_in_parallel: bool,
+
+    /// Enable cleanup of stale transient artifacts.
+    pub transient_cleanup_enabled: bool,
+
+    /// Time-to-live in hours for stale transient artifacts.
+    pub transient_ttl_hours: u64,
+
+    /// Time-to-live in hours for failed journal files.
+    pub failed_journal_ttl_hours: u64,
+
+    /// Time-to-live in hours for completed journal files.
+    pub completed_journal_ttl_hours: u64,
 }
 
 impl Default for OllamaLibrary {
@@ -102,6 +119,10 @@ impl Default for OllamaLibrary {
             timeout: 120.0,
             chunk_size_mib: 128,
             download_chunks_in_parallel: true,
+            transient_cleanup_enabled: true,
+            transient_ttl_hours: 72,
+            failed_journal_ttl_hours: 168,
+            completed_journal_ttl_hours: 24,
         }
     }
 }
@@ -248,6 +269,16 @@ impl AppSettings {
                 Value::Bool(defaults.check_model_presence),
             );
         }
+        if !ollama_server.contains_key("keep_verified_blobs_on_error") {
+            warn!(
+                "Missing field 'ollama_server.keep_verified_blobs_on_error', using default: {}",
+                defaults.keep_verified_blobs_on_error
+            );
+            ollama_server.insert(
+                "keep_verified_blobs_on_error".to_string(),
+                Value::Bool(defaults.keep_verified_blobs_on_error),
+            );
+        }
 
         // Get or create the ollama_library object
         let mut ollama_library = parsed
@@ -323,6 +354,48 @@ impl AppSettings {
             ollama_library.insert(
                 "download_chunks_in_parallel".to_string(),
                 Value::Bool(defaults.download_chunks_in_parallel),
+            );
+        }
+        if !ollama_library.contains_key("transient_cleanup_enabled") {
+            warn!(
+                "Missing field 'ollama_library.transient_cleanup_enabled', using default: {}",
+                defaults.transient_cleanup_enabled
+            );
+            ollama_library.insert(
+                "transient_cleanup_enabled".to_string(),
+                Value::Bool(defaults.transient_cleanup_enabled),
+            );
+        }
+        if !ollama_library.contains_key("transient_ttl_hours") {
+            warn!(
+                "Missing field 'ollama_library.transient_ttl_hours', using default: {}",
+                defaults.transient_ttl_hours
+            );
+            ollama_library.insert(
+                "transient_ttl_hours".to_string(),
+                Value::Number(serde_json::Number::from(defaults.transient_ttl_hours)),
+            );
+        }
+        if !ollama_library.contains_key("failed_journal_ttl_hours") {
+            warn!(
+                "Missing field 'ollama_library.failed_journal_ttl_hours', using default: {}",
+                defaults.failed_journal_ttl_hours
+            );
+            ollama_library.insert(
+                "failed_journal_ttl_hours".to_string(),
+                Value::Number(serde_json::Number::from(defaults.failed_journal_ttl_hours)),
+            );
+        }
+        if !ollama_library.contains_key("completed_journal_ttl_hours") {
+            warn!(
+                "Missing field 'ollama_library.completed_journal_ttl_hours', using default: {}",
+                defaults.completed_journal_ttl_hours
+            );
+            ollama_library.insert(
+                "completed_journal_ttl_hours".to_string(),
+                Value::Number(serde_json::Number::from(
+                    defaults.completed_journal_ttl_hours,
+                )),
             );
         }
 
@@ -440,6 +513,16 @@ pub fn get_settings_file_path() -> Result<PathBuf, io::Error> {
         ProjectDirs::from("", "", "odir").expect("Failed to determine config directory");
 
     get_settings_file_path_for_dir(proj_dirs.config_dir())
+}
+
+/// Get the path to the journal directory using OS-standard user data directories.
+///
+/// Returns `<data_local_dir>/journals` and creates it if needed.
+pub fn get_journal_dir_path() -> Result<PathBuf, io::Error> {
+    let proj_dirs = ProjectDirs::from("", "", "odir").expect("Failed to determine data directory");
+    let journal_dir = proj_dirs.data_local_dir().join("journals");
+    fs::create_dir_all(&journal_dir)?;
+    Ok(journal_dir)
 }
 
 /// Get the path to the settings file and panic on error.

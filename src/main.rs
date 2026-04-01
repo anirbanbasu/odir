@@ -3,8 +3,9 @@
 //! The source code is available in the [GitHub repository](
 //! https://github.com/anirbanbasu/odir).
 
+use chrono::{Local, TimeZone};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use log::{debug, error, info, warn};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -13,6 +14,8 @@ mod config;
 use config::{AppSettings, Config};
 
 mod downloader;
+use downloader::manifest::{DownloadJournalListEntry, DownloadSourceType};
+use downloader::utils::{clear_journal_for_model, list_available_journals, load_journal_for_model};
 use downloader::{
     DownloaderError, HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader,
 };
@@ -124,6 +127,52 @@ enum Commands {
         /// Path to the existing Ollama Downloader settings file.
         od_settings_file: String,
     },
+
+    #[command(subcommand_help_heading = "Diagnostics")]
+    /// Displays the advisory download journal for a model.
+    Journal {
+        /// Model identifier used for the download, e.g. llama3.2:8b or user/repo:Q4_K_M.
+        #[arg(required_unless_present = "list")]
+        model_identifier: Option<String>,
+
+        /// List all available journals.
+        #[arg(long)]
+        list: bool,
+
+        /// Source type for the journal lookup.
+        #[arg(long)]
+        source: Option<JournalSourceArg>,
+
+        /// Delete the journal for one specific model (with confirmation).
+        #[arg(long, conflicts_with = "list", conflicts_with = "json")]
+        clear: bool,
+
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum JournalSourceArg {
+    Ollama,
+    Hf,
+}
+
+impl From<JournalSourceArg> for DownloadSourceType {
+    fn from(value: JournalSourceArg) -> Self {
+        match value {
+            JournalSourceArg::Ollama => DownloadSourceType::Ollama,
+            JournalSourceArg::Hf => DownloadSourceType::Hf,
+        }
+    }
+}
+
+fn format_epoch_local_rfc2822(epoch_seconds: u64) -> String {
+    match Local.timestamp_opt(epoch_seconds as i64, 0).single() {
+        Some(dt) => dt.to_rfc2822(),
+        None => format!("{}", epoch_seconds),
+    }
 }
 
 /// Prompts the user for a string input with a default value.
@@ -300,6 +349,11 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
         settings.ollama_server.check_model_presence,
     );
 
+    settings.ollama_server.keep_verified_blobs_on_error = prompt_bool(
+        "Keep verified blobs on error?",
+        settings.ollama_server.keep_verified_blobs_on_error,
+    );
+
     // Ollama Library settings
     println!("\n--- Ollama Library Settings ---");
     settings.ollama_library.models_path =
@@ -334,6 +388,29 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
     settings.ollama_library.download_chunks_in_parallel = prompt_bool(
         "Download chunks in parallel?",
         settings.ollama_library.download_chunks_in_parallel,
+    );
+
+    settings.ollama_library.transient_cleanup_enabled = prompt_bool(
+        "Enable transient artifact cleanup?",
+        settings.ollama_library.transient_cleanup_enabled,
+    );
+
+    settings.ollama_library.transient_ttl_hours = prompt_u64_choice(
+        "Transient artifact TTL (hours)",
+        settings.ollama_library.transient_ttl_hours,
+        &[0, 24, 48, 72, 96, 168, 336],
+    );
+
+    settings.ollama_library.failed_journal_ttl_hours = prompt_u64_choice(
+        "Failed journal TTL (hours)",
+        settings.ollama_library.failed_journal_ttl_hours,
+        &[0, 24, 48, 72, 96, 168, 336],
+    );
+
+    settings.ollama_library.completed_journal_ttl_hours = prompt_u64_choice(
+        "Completed journal TTL (hours)",
+        settings.ollama_library.completed_journal_ttl_hours,
+        &[0, 12, 24, 48, 72, 168],
     );
 
     println!("\n=== Configuration Complete ===\n");
@@ -688,6 +765,202 @@ fn handle_od_copy_settings(od_settings_file: String) {
     }
 }
 
+fn handle_journal(
+    model_identifier: Option<String>,
+    list: bool,
+    source: Option<JournalSourceArg>,
+    clear: bool,
+    as_json: bool,
+) {
+    let source_hint = source.map(DownloadSourceType::from);
+    if list {
+        match list_available_journals(source_hint) {
+            Ok(journals) => {
+                if as_json {
+                    let list_entries: Vec<DownloadJournalListEntry> = journals
+                        .iter()
+                        .map(|journal| DownloadJournalListEntry {
+                            model_identifier: journal.model_identifier.clone(),
+                            source_type: journal.source_type.clone(),
+                            tag_or_quant: journal.tag_or_quant.clone(),
+                            updated_at: journal.updated_at,
+                            item_count: journal.items.len(),
+                        })
+                        .collect();
+
+                    match serde_json::to_string_pretty(&list_entries) {
+                        Ok(serialized) => println!("{}", serialized),
+                        Err(e) => {
+                            error!("Failed to serialize journal list as JSON: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                    return;
+                }
+
+                if journals.is_empty() {
+                    println!("No journals found");
+                    return;
+                }
+
+                println!("Available journals ({}):", journals.len());
+                for journal in journals {
+                    println!(
+                        "- {} | {:?} | {} | updated={} | items={}",
+                        journal.model_identifier,
+                        journal.source_type,
+                        journal.tag_or_quant,
+                        journal.updated_at,
+                        journal.items.len()
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                error!("Failed to list journals: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let model_identifier =
+        model_identifier.expect("clap should require model_identifier unless --list");
+    match load_journal_for_model(&model_identifier, source_hint.clone()) {
+        Ok(journal) => {
+            if clear {
+                let journal_is_completed = journal.items.iter().all(|item| {
+                    matches!(
+                        item.state,
+                        crate::downloader::manifest::JournalItemState::Completed
+                    )
+                });
+                let source_label = match journal.source_type {
+                    DownloadSourceType::Ollama => "ollama",
+                    DownloadSourceType::Hf => "hf",
+                };
+                if journal_is_completed {
+                    print!(
+                        "Do you really want to delete the download journal {} from {}? This model download has completed, hence its journal can be safely cleared without deleting the downloaded model. [y/N]: ",
+                        model_identifier, source_label
+                    );
+                } else {
+                    print!(
+                        "Do you really want to delete the download journal {} from {}? If you do, this model download cannot be resumed from its current state. [y/N]: ",
+                        model_identifier, source_label
+                    );
+                }
+                if io::stdout().flush().is_err() {
+                    error!("Failed to flush confirmation prompt");
+                    std::process::exit(1);
+                }
+
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input).is_err() {
+                    error!("Failed to read confirmation response");
+                    std::process::exit(1);
+                }
+                let confirmed = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
+                if !confirmed {
+                    println!("Journal clear cancelled");
+                    return;
+                }
+
+                let settings = match AppSettings::load_or_create_default(
+                    config::get_settings_file_path_or_panic(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to load settings for journal clear: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                match clear_journal_for_model(
+                    &model_identifier,
+                    journal.source_type.clone(),
+                    &settings.ollama_library.models_path,
+                ) {
+                    Ok(summary) => {
+                        if summary.had_completed_download {
+                            println!(
+                                "Deleted journal for {} (source: {}); completed download data was kept",
+                                model_identifier, source_label
+                            );
+                        } else {
+                            println!(
+                                "Deleted journal for {} (source: {}); removed {} partial file(s)",
+                                model_identifier, source_label, summary.removed_partial_files
+                            );
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        error!("Failed to clear journal for '{}': {}", model_identifier, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            if as_json {
+                match serde_json::to_string_pretty(&journal) {
+                    Ok(serialized) => {
+                        println!("{}", serialized);
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize journal as JSON: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
+            println!("Model: {}", journal.model_identifier);
+            println!("Source: {:?}", journal.source_type);
+            println!("Tag or Quantisation: {}", journal.tag_or_quant);
+            println!(
+                "Started At: {}",
+                format_epoch_local_rfc2822(journal.started_at)
+            );
+            println!(
+                "Updated At: {}",
+                format_epoch_local_rfc2822(journal.updated_at)
+            );
+            let total_items = journal.items.len();
+            let completed_items = journal
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.state,
+                        crate::downloader::manifest::JournalItemState::Completed
+                    )
+                })
+                .count();
+            let completed_pct = if total_items == 0 {
+                0.0
+            } else {
+                (completed_items as f64) * 100.0 / (total_items as f64)
+            };
+            println!(
+                "Completed: {:.2}% ({}/{} items)",
+                completed_pct, completed_items, total_items
+            );
+            println!("Items:");
+            for item in journal.items {
+                let err = item.last_error.unwrap_or_else(|| "-".to_string());
+                println!(
+                    "  - {} | {} | {} bytes | {:?} | {}",
+                    item.digest, item.media_type, item.size, item.state, err
+                );
+            }
+        }
+        Err(e) => {
+            error!("Failed to load journal for '{}': {}", model_identifier, e);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// The main entry point for the Ollama Downloader in Rust (ODIR) command-line application.
 fn main() {
     // Initialize configuration from environment variables
@@ -718,6 +991,7 @@ fn main() {
             | Commands::HfListModels { .. }
             | Commands::HfListTags { .. }
             | Commands::HfModelDownload { .. }
+            | Commands::Journal { .. }
     );
     signal_handler::set_confirmation_required(requires_interrupt_confirmation);
 
@@ -731,5 +1005,12 @@ fn main() {
         Commands::HfListTags { model_identifier } => handle_hf_list_tags(model_identifier),
         Commands::HfModelDownload { user_repo_quant } => handle_hf_model_download(user_repo_quant),
         Commands::OdCopySettings { od_settings_file } => handle_od_copy_settings(od_settings_file),
+        Commands::Journal {
+            model_identifier,
+            list,
+            source,
+            clear,
+            json,
+        } => handle_journal(model_identifier, list, source, clear, json),
     }
 }

@@ -25,6 +25,7 @@ signal-hook = "0.4"
 crossterm = "0.29"
 url = "2.5.8"
 hex = "0.4"
+chrono = "0.4"
 
 [dev-dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }

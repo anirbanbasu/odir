@@ -59,7 +59,8 @@ Let's explore the configuration in details. The default content is as follows.
         "url": "http://localhost:11434",
         "api_key": null,
         "remove_downloaded_on_error": true,
-        "check_model_presence": true
+      "check_model_presence": true,
+      "keep_verified_blobs_on_error": true
     },
     "ollama_library": {
         "models_path": "~/.ollama/models",
@@ -68,7 +69,11 @@ Let's explore the configuration in details. The default content is as follows.
         "verify_ssl": true,
         "timeout": 120.0,
         "chunk_size_mib": 128,
-        "download_chunks_in_parallel": true
+      "download_chunks_in_parallel": true,
+      "transient_cleanup_enabled": true,
+      "transient_ttl_hours": 72,
+      "failed_journal_ttl_hours": 168,
+      "completed_journal_ttl_hours": 24
     }
 }
 ```
@@ -81,6 +86,7 @@ There are two main configuration groups: `ollama_server` and `ollama_library`. T
 - The `api_key` is only necessary if your Ollama server endpoint expects an API key to connect, which is typically not the case.
 - The `remove_downloaded_on_error` is a boolean flag, typically set to `true`. This helps specify whether this downloader tool should remove downloaded files (including temporary files) if it fails to connect to the Ollama server or fails to find the downloaded model.
 - The `check_model_presence` is a boolean flag, typically set to `true`. This helps specify whether this downloader tool should check for the presence of the model in the Ollama server after downloading it.
+- The `keep_verified_blobs_on_error` is a boolean flag, typically set to `true`. When enabled, already verified blobs are preserved across failures so reruns only fetch missing/invalid blobs. Set this to `false` to restore strict rollback behavior.
 
 ### `ollama_library`
 
@@ -91,6 +97,55 @@ There are two main configuration groups: `ollama_server` and `ollama_library`. T
 - The self-explanatory `timeout` specifies the number of seconds to wait before any HTTPS connection to the Ollama registry or library should be allowed to fail.
 - The `chunk_size_mib` controls the size (in MiB) of each chunk when downloading large model blobs. Large blobs are split into sequential byte-range requests of this size, which makes downloads more robust over unreliable connections. If a download is interrupted by a network error, only the missing parts will be re-fetched on the next run. Set to `0` to disable chunked downloading and download each blob in a single stream. The value must be one of `0`, `32`, `64`, `128`, `256`, or `512`. The default is `128` (128 MiB). Note that if the remote server does not support chunked downloading, or if the blob is smaller than the configured chunk size, the download will automatically fall back to single-stream mode regardless of this setting.
 - The `download_chunks_in_parallel` controls whether chunked downloads use multiple workers (`true`) or a single worker (`false`). The default is `true`. This setting has effect only when chunked downloading is active (`chunk_size_mib > 0`) and the server supports byte-range downloads.
+- The `transient_cleanup_enabled` controls whether stale transient artifacts should be cleaned up automatically before and after downloads. Default is `true`.
+- The `transient_ttl_hours` controls the age threshold (in hours) used to remove stale transient files such as chunk work files under `.parts`. Default is `72`.
+- The `failed_journal_ttl_hours` controls how long failed/incomplete journal files are kept before cleanup. Default is `168`.
+- The `completed_journal_ttl_hours` controls how long completed journal files are kept before cleanup. Default is `24`.
+
+### Journal diagnostics
+
+ODIR maintains an advisory download journal per model in its application data directory (not in the Ollama models directory). You can inspect it with:
+
+```bash
+odir journal <model_identifier>
+```
+
+To emit machine-readable output instead of the default human-friendly view:
+
+```bash
+odir journal <model_identifier> --json
+```
+
+The human-friendly per-model view also includes a computed `Completed` field
+showing progress as a percentage of completed items in the journal.
+
+Optional source selection can be provided with `--source ollama` or `--source hf`.
+
+To list all available journals without providing a model identifier:
+
+```bash
+odir journal --list
+```
+
+You can combine list mode with JSON output:
+
+```bash
+odir journal --list --json
+```
+
+In list JSON mode, each entry contains `model_identifier`, `source_type`,
+`tag_or_quant`, `updated_at`, and `item_count`.
+
+To delete one specific journal and remove resumable partial data for incomplete
+downloads:
+
+```bash
+odir journal <model_identifier> --clear
+```
+
+`--clear` asks for confirmation with a default answer of `N` (No). If the
+journal indicates the download had already completed, only the journal file is
+deleted and completed model data is kept.
 
 ## Environment variables
 
@@ -128,6 +183,7 @@ Commands:
   hf-list-tags       Lists all available quantisations as tags for a Hugging Face model that can be downloaded into Ollama
   hf-model-download  Downloads a specified Hugging Face model
   od-copy-settings   Copies a Ollama Downloader settings file to the ODIR settings location
+  journal            Displays the advisory download journal for a model
   help               Print this message or the help of the given subcommand(s)
 
 Options:
