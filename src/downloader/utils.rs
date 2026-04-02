@@ -19,10 +19,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::env;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -1969,11 +1972,22 @@ fn ensure_ownership_for_dir_tree(models_root: &Path, dir: &Path, ownership: Owne
 fn apply_ownership(path: &Path, ownership: Ownership) {
     #[cfg(unix)]
     {
-        let spec = format!("{}:{}", ownership.uid, ownership.gid);
-        match Command::new("chown").arg(&spec).arg(path).status() {
-            Ok(status) if status.success() => {}
-            Ok(status) => warn!("Failed to chown {:?}: exit status {}", path, status),
-            Err(e) => warn!("Failed to chown {:?}: {}", path, e),
+        let path_bytes = path.as_os_str().as_bytes();
+        match CString::new(path_bytes) {
+            Ok(path_cstr) => {
+                let rc = unsafe {
+                    libc::chown(
+                        path_cstr.as_ptr(),
+                        ownership.uid as libc::uid_t,
+                        ownership.gid as libc::gid_t,
+                    )
+                };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    warn!("Failed to chown {:?}: {}", path, err);
+                }
+            }
+            Err(e) => warn!("Failed to chown {:?}: invalid path bytes ({})", path, e),
         }
     }
     #[cfg(not(unix))]
