@@ -2,7 +2,7 @@
 
 ## Goal
 
-Make model download resume robust across multi-layer failures by persisting verified blobs, adding a lightweight download journal, and introducing cleanup policies for transient artifacts.
+Make model download resume robust across multi-layer failures by persisting verified blobs, adding a lightweight download journal, and introducing cleanup policies for transient artefacts.
 
 ## Out of Scope
 
@@ -15,7 +15,7 @@ Make model download resume robust across multi-layer failures by persisting veri
 - Commit boundary is per blob, not per model.
 - Manifest write remains final and atomic.
 - Journal is advisory and reconciled against filesystem truth.
-- Cleanup targets transient artifacts first, never verified blobs by default.
+- Cleanup targets transient artefacts first, never verified blobs by default.
 
 ## Phase 1: Blob-Level Durability and Resume
 
@@ -180,7 +180,7 @@ Acceptance:
 - Users can inspect journal progress and failure reasons without manual file inspection.
 - Journal remains an internal advisory state; manual editing is unsupported and unnecessary.
 
-## Phase 3: Cleanup Policy for Transient Artifacts
+## Phase 3: Cleanup Policy for Transient Artefacts
 
 ### 3.1 Add cleanup policy settings
 
@@ -225,7 +225,7 @@ Tasks:
 
 Acceptance:
 
-- Storage does not grow unbounded from transient artifacts.
+- Storage does not grow unbounded from transient artefacts.
 
 ### 3.3 Optional strict rollback mode
 
@@ -263,7 +263,7 @@ Cases:
 - Journal serialization and deserialization roundtrip.
 - Corrupt journal recovery path.
 - Atomic journal writes produce valid files.
-- Cleanup TTL removes only stale transient artifacts.
+- Cleanup TTL removes only stale transient artefacts.
 
 ## Integration Tests
 
@@ -292,4 +292,4 @@ Cases:
 
 - Favor adding reusable helpers in src/downloader/utils.rs for shared behavior.
 - Keep source-specific logic in src/downloader/ollama_downloader.rs and src/downloader/hf_downloader.rs limited to manifest parsing and naming differences.
-- Ensure cleanup_unnecessary_files semantics are clearly split between transient and committed artifacts.
+- Ensure cleanup_unnecessary_files semantics are clearly split between transient and committed artefacts.

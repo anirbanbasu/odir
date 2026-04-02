@@ -96,10 +96,10 @@ pub struct OllamaLibrary {
     /// Default is true.
     pub download_chunks_in_parallel: bool,
 
-    /// Enable cleanup of stale transient artifacts.
+    /// Enable cleanup of stale transient artefacts.
     pub transient_cleanup_enabled: bool,
 
-    /// Time-to-live in hours for stale transient artifacts.
+    /// Time-to-live in hours for stale transient artefacts.
     pub transient_ttl_hours: u64,
 
     /// Time-to-live in hours for failed journal files.

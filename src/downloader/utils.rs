@@ -451,7 +451,7 @@ pub struct CleanupSummary {
     pub removed_completed_journals: u64,
 }
 
-pub fn cleanup_stale_transient_artifacts(settings: &AppSettings) -> Result<CleanupSummary> {
+pub fn cleanup_stale_transient_artefacts(settings: &AppSettings) -> Result<CleanupSummary> {
     if !settings.ollama_library.transient_cleanup_enabled {
         return Ok(CleanupSummary::default());
     }
@@ -2136,7 +2136,7 @@ mod tests {
         };
 
         std::thread::sleep(Duration::from_secs(1));
-        let summary = cleanup_stale_transient_artifacts(&settings).expect("cleanup");
+        let summary = cleanup_stale_transient_artefacts(&settings).expect("cleanup");
         assert!(summary.removed_transient_files >= 1);
         assert!(!transient_file.exists());
     }

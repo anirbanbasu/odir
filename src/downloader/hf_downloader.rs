@@ -7,7 +7,7 @@ use crate::downloader::model_downloader::{
     DownloaderError, ModelDownloader, Result, http_status_error_from_response,
 };
 use crate::downloader::utils::{
-    BlobDownloadRequest, Ownership, blob_path_from_digest, cleanup_stale_transient_artifacts,
+    BlobDownloadRequest, Ownership, blob_path_from_digest, cleanup_stale_transient_artefacts,
     cleanup_unnecessary_files, download_model_blob, expand_models_path, infer_models_dir_ownership,
     initialize_or_reconcile_journal, is_model_present_in_ollama, remove_blob_if_invalid, save_blob,
     save_manifest, update_journal_item_state, verify_blob_file_digest,
@@ -179,7 +179,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         // Warn about ownership issues before attempting download
         warn_if_models_path_requires_root(&self.settings.ollama_library.models_path, true);
 
-        if let Err(e) = cleanup_stale_transient_artifacts(&self.settings) {
+        if let Err(e) = cleanup_stale_transient_artefacts(&self.settings) {
             warn!("Transient cleanup failed at downloader start: {}", e);
         }
 
@@ -490,7 +490,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         // Clear unnecessary files list on success
         self_mut.unnecessary_files.clear();
 
-        if let Err(e) = cleanup_stale_transient_artifacts(&self.settings) {
+        if let Err(e) = cleanup_stale_transient_artefacts(&self.settings) {
             warn!("Transient cleanup failed at downloader end: {}", e);
         }
 

@@ -391,12 +391,12 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
     );
 
     settings.ollama_library.transient_cleanup_enabled = prompt_bool(
-        "Enable transient artifact cleanup?",
+        "Enable transient artefact cleanup?",
         settings.ollama_library.transient_cleanup_enabled,
     );
 
     settings.ollama_library.transient_ttl_hours = prompt_u64_choice(
-        "Transient artifact TTL (hours)",
+        "Transient artefact TTL (hours)",
         settings.ollama_library.transient_ttl_hours,
         &[0, 24, 48, 72, 96, 168, 336],
     );
