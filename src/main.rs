@@ -14,7 +14,7 @@ mod config;
 use config::{AppSettings, Config};
 
 mod downloader;
-use downloader::manifest::{DownloadJournalListEntry, DownloadSourceType};
+use downloader::manifest::{DownloadJournal, DownloadJournalListEntry, DownloadSourceType};
 use downloader::utils::{clear_journal_for_model, list_available_journals, load_journal_for_model};
 use downloader::{
     DownloaderError, HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader,
@@ -765,6 +765,208 @@ fn handle_od_copy_settings(od_settings_file: String) {
     }
 }
 
+fn journal_source_label(source_type: &DownloadSourceType) -> &'static str {
+    match source_type {
+        DownloadSourceType::Ollama => "ollama",
+        DownloadSourceType::Hf => "hf",
+    }
+}
+
+fn is_journal_completed(journal: &DownloadJournal) -> bool {
+    journal.items.iter().all(|item| {
+        matches!(
+            item.state,
+            crate::downloader::manifest::JournalItemState::Completed
+        )
+    })
+}
+
+fn print_journal_list_json(journals: &[DownloadJournal]) {
+    let list_entries: Vec<DownloadJournalListEntry> = journals
+        .iter()
+        .map(|journal| DownloadJournalListEntry {
+            model_identifier: journal.model_identifier.clone(),
+            source_type: journal.source_type.clone(),
+            tag_or_quant: journal.tag_or_quant.clone(),
+            updated_at: journal.updated_at,
+            item_count: journal.items.len(),
+        })
+        .collect();
+
+    match serde_json::to_string_pretty(&list_entries) {
+        Ok(serialized) => println!("{}", serialized),
+        Err(e) => {
+            error!("Failed to serialize journal list as JSON: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_journal_list_text(journals: &[DownloadJournal]) {
+    if journals.is_empty() {
+        println!("No journals found");
+        return;
+    }
+
+    println!("Available journals ({}):", journals.len());
+    for journal in journals {
+        println!(
+            "- {} | {:?} | {} | updated={} | items={}",
+            journal.model_identifier,
+            journal.source_type,
+            journal.tag_or_quant,
+            journal.updated_at,
+            journal.items.len()
+        );
+    }
+}
+
+fn handle_journal_list(source_hint: Option<DownloadSourceType>, as_json: bool) {
+    match list_available_journals(source_hint) {
+        Ok(journals) => {
+            if as_json {
+                print_journal_list_json(&journals);
+            } else {
+                print_journal_list_text(&journals);
+            }
+        }
+        Err(e) => {
+            error!("Failed to list journals: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn confirm_journal_clear(
+    model_identifier: &str,
+    source_label: &str,
+    journal_is_completed: bool,
+) -> bool {
+    if journal_is_completed {
+        print!(
+            "Do you really want to delete the download journal {} from {}? This model download has completed, hence its journal can be safely cleared without deleting the downloaded model. [y/N]: ",
+            model_identifier, source_label
+        );
+    } else {
+        print!(
+            "Do you really want to delete the download journal {} from {}? If you do, this model download cannot be resumed from its current state. [y/N]: ",
+            model_identifier, source_label
+        );
+    }
+
+    if io::stdout().flush().is_err() {
+        error!("Failed to flush confirmation prompt");
+        std::process::exit(1);
+    }
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        error!("Failed to read confirmation response");
+        std::process::exit(1);
+    }
+
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+fn handle_journal_clear(model_identifier: &str, journal: &DownloadJournal) {
+    let journal_is_completed = is_journal_completed(journal);
+    let source_label = journal_source_label(&journal.source_type);
+    let confirmed = confirm_journal_clear(model_identifier, source_label, journal_is_completed);
+    if !confirmed {
+        println!("Journal clear cancelled");
+        return;
+    }
+
+    let settings =
+        match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to load settings for journal clear: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+    match clear_journal_for_model(
+        model_identifier,
+        journal.source_type.clone(),
+        &settings.ollama_library.models_path,
+    ) {
+        Ok(summary) => {
+            if summary.had_completed_download {
+                println!(
+                    "Deleted journal for {} (source: {}); completed download data was kept",
+                    model_identifier, source_label
+                );
+            } else {
+                println!(
+                    "Deleted journal for {} (source: {}); removed {} partial file(s)",
+                    model_identifier, source_label, summary.removed_partial_files
+                );
+            }
+        }
+        Err(e) => {
+            error!("Failed to clear journal for '{}': {}", model_identifier, e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_journal_json(journal: &DownloadJournal) {
+    match serde_json::to_string_pretty(journal) {
+        Ok(serialized) => {
+            println!("{}", serialized);
+        }
+        Err(e) => {
+            error!("Failed to serialize journal as JSON: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_journal_text(journal: DownloadJournal) {
+    println!("Model: {}", journal.model_identifier);
+    println!("Source: {:?}", journal.source_type);
+    println!("Tag or Quantisation: {}", journal.tag_or_quant);
+    println!(
+        "Started At: {}",
+        format_epoch_local_rfc2822(journal.started_at)
+    );
+    println!(
+        "Updated At: {}",
+        format_epoch_local_rfc2822(journal.updated_at)
+    );
+
+    let total_items = journal.items.len();
+    let completed_items = journal
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.state,
+                crate::downloader::manifest::JournalItemState::Completed
+            )
+        })
+        .count();
+    let completed_pct = if total_items == 0 {
+        0.0
+    } else {
+        (completed_items as f64) * 100.0 / (total_items as f64)
+    };
+
+    println!(
+        "Completed: {:.2}% ({}/{} items)",
+        completed_pct, completed_items, total_items
+    );
+    println!("Items:");
+    for item in journal.items {
+        let err = item.last_error.unwrap_or_else(|| "-".to_string());
+        println!(
+            "  - {} | {} | {} bytes | {:?} | {}",
+            item.digest, item.media_type, item.size, item.state, err
+        );
+    }
+}
+
 fn handle_journal(
     model_identifier: Option<String>,
     list: bool,
@@ -774,184 +976,23 @@ fn handle_journal(
 ) {
     let source_hint = source.map(DownloadSourceType::from);
     if list {
-        match list_available_journals(source_hint) {
-            Ok(journals) => {
-                if as_json {
-                    let list_entries: Vec<DownloadJournalListEntry> = journals
-                        .iter()
-                        .map(|journal| DownloadJournalListEntry {
-                            model_identifier: journal.model_identifier.clone(),
-                            source_type: journal.source_type.clone(),
-                            tag_or_quant: journal.tag_or_quant.clone(),
-                            updated_at: journal.updated_at,
-                            item_count: journal.items.len(),
-                        })
-                        .collect();
-
-                    match serde_json::to_string_pretty(&list_entries) {
-                        Ok(serialized) => println!("{}", serialized),
-                        Err(e) => {
-                            error!("Failed to serialize journal list as JSON: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                    return;
-                }
-
-                if journals.is_empty() {
-                    println!("No journals found");
-                    return;
-                }
-
-                println!("Available journals ({}):", journals.len());
-                for journal in journals {
-                    println!(
-                        "- {} | {:?} | {} | updated={} | items={}",
-                        journal.model_identifier,
-                        journal.source_type,
-                        journal.tag_or_quant,
-                        journal.updated_at,
-                        journal.items.len()
-                    );
-                }
-                return;
-            }
-            Err(e) => {
-                error!("Failed to list journals: {}", e);
-                std::process::exit(1);
-            }
-        }
+        handle_journal_list(source_hint, as_json);
+        return;
     }
 
     let model_identifier =
         model_identifier.expect("clap should require model_identifier unless --list");
-    match load_journal_for_model(&model_identifier, source_hint.clone()) {
+    match load_journal_for_model(&model_identifier, source_hint) {
         Ok(journal) => {
             if clear {
-                let journal_is_completed = journal.items.iter().all(|item| {
-                    matches!(
-                        item.state,
-                        crate::downloader::manifest::JournalItemState::Completed
-                    )
-                });
-                let source_label = match journal.source_type {
-                    DownloadSourceType::Ollama => "ollama",
-                    DownloadSourceType::Hf => "hf",
-                };
-                if journal_is_completed {
-                    print!(
-                        "Do you really want to delete the download journal {} from {}? This model download has completed, hence its journal can be safely cleared without deleting the downloaded model. [y/N]: ",
-                        model_identifier, source_label
-                    );
-                } else {
-                    print!(
-                        "Do you really want to delete the download journal {} from {}? If you do, this model download cannot be resumed from its current state. [y/N]: ",
-                        model_identifier, source_label
-                    );
-                }
-                if io::stdout().flush().is_err() {
-                    error!("Failed to flush confirmation prompt");
-                    std::process::exit(1);
-                }
-
-                let mut input = String::new();
-                if io::stdin().read_line(&mut input).is_err() {
-                    error!("Failed to read confirmation response");
-                    std::process::exit(1);
-                }
-                let confirmed = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
-                if !confirmed {
-                    println!("Journal clear cancelled");
-                    return;
-                }
-
-                let settings = match AppSettings::load_or_create_default(
-                    config::get_settings_file_path_or_panic(),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to load settings for journal clear: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-
-                match clear_journal_for_model(
-                    &model_identifier,
-                    journal.source_type.clone(),
-                    &settings.ollama_library.models_path,
-                ) {
-                    Ok(summary) => {
-                        if summary.had_completed_download {
-                            println!(
-                                "Deleted journal for {} (source: {}); completed download data was kept",
-                                model_identifier, source_label
-                            );
-                        } else {
-                            println!(
-                                "Deleted journal for {} (source: {}); removed {} partial file(s)",
-                                model_identifier, source_label, summary.removed_partial_files
-                            );
-                        }
-                        return;
-                    }
-                    Err(e) => {
-                        error!("Failed to clear journal for '{}': {}", model_identifier, e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            if as_json {
-                match serde_json::to_string_pretty(&journal) {
-                    Ok(serialized) => {
-                        println!("{}", serialized);
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize journal as JSON: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                handle_journal_clear(&model_identifier, &journal);
                 return;
             }
 
-            println!("Model: {}", journal.model_identifier);
-            println!("Source: {:?}", journal.source_type);
-            println!("Tag or Quantisation: {}", journal.tag_or_quant);
-            println!(
-                "Started At: {}",
-                format_epoch_local_rfc2822(journal.started_at)
-            );
-            println!(
-                "Updated At: {}",
-                format_epoch_local_rfc2822(journal.updated_at)
-            );
-            let total_items = journal.items.len();
-            let completed_items = journal
-                .items
-                .iter()
-                .filter(|item| {
-                    matches!(
-                        item.state,
-                        crate::downloader::manifest::JournalItemState::Completed
-                    )
-                })
-                .count();
-            let completed_pct = if total_items == 0 {
-                0.0
+            if as_json {
+                print_journal_json(&journal);
             } else {
-                (completed_items as f64) * 100.0 / (total_items as f64)
-            };
-            println!(
-                "Completed: {:.2}% ({}/{} items)",
-                completed_pct, completed_items, total_items
-            );
-            println!("Items:");
-            for item in journal.items {
-                let err = item.last_error.unwrap_or_else(|| "-".to_string());
-                println!(
-                    "  - {} | {} | {} bytes | {:?} | {}",
-                    item.digest, item.media_type, item.size, item.state, err
-                );
+                print_journal_text(journal);
             }
         }
         Err(e) => {

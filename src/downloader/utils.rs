@@ -358,6 +358,34 @@ pub struct JournalClearSummary {
     pub had_completed_download: bool,
 }
 
+fn remove_partial_files_for_journal(journal: &DownloadJournal, models_path: &str) -> Result<u64> {
+    let models_root = expand_models_path(models_path)?;
+    let parts_root = models_root.join("blobs").join(".parts");
+    if !parts_root.exists() {
+        return Ok(0);
+    }
+
+    let mut removed_partial_files = 0;
+    for item in &journal.items {
+        let stem = item.digest.replace(':', "-");
+        let candidates = [
+            parts_root.join(format!("{}.bin", stem)),
+            parts_root.join(format!("{}.state.json", stem)),
+            parts_root.join(format!("{}.state.tmp", stem)),
+            parts_root.join(format!("{}.state.bak", stem)),
+        ];
+
+        for path in candidates {
+            if path.exists() {
+                fs::remove_file(&path)?;
+                removed_partial_files += 1;
+            }
+        }
+    }
+
+    Ok(removed_partial_files)
+}
+
 pub fn clear_journal_for_model(
     model_identifier: &str,
     source: DownloadSourceType,
@@ -373,27 +401,7 @@ pub fn clear_journal_for_model(
     summary.had_completed_download = is_completed;
 
     if !is_completed {
-        let models_root = expand_models_path(models_path)?;
-        let parts_root = models_root.join("blobs").join(".parts");
-
-        if parts_root.exists() {
-            for item in &journal.items {
-                let stem = item.digest.replace(':', "-");
-                let candidates = [
-                    parts_root.join(format!("{}.bin", stem)),
-                    parts_root.join(format!("{}.state.json", stem)),
-                    parts_root.join(format!("{}.state.tmp", stem)),
-                    parts_root.join(format!("{}.state.bak", stem)),
-                ];
-
-                for path in candidates {
-                    if path.exists() {
-                        fs::remove_file(&path)?;
-                        summary.removed_partial_files += 1;
-                    }
-                }
-            }
-        }
+        summary.removed_partial_files = remove_partial_files_for_journal(&journal, models_path)?;
     }
 
     if journal_path.exists() {
@@ -451,6 +459,96 @@ pub struct CleanupSummary {
     pub removed_completed_journals: u64,
 }
 
+fn entry_age(entry: &fs::DirEntry, now: SystemTime) -> Option<Duration> {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| now.duration_since(m).ok())
+}
+
+fn is_json_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|v| v.to_str())
+        .map(|ext| ext == "json")
+        .unwrap_or(false)
+}
+
+fn remove_stale_transient_files(
+    parts_dir: &Path,
+    now: SystemTime,
+    transient_ttl: Duration,
+) -> Result<u64> {
+    if !parts_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed_count = 0;
+    for entry in fs::read_dir(parts_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let age_ok = entry_age(&entry, now)
+            .map(|age| age > transient_ttl)
+            .unwrap_or(false);
+        if age_ok {
+            fs::remove_file(&path)?;
+            removed_count += 1;
+        }
+    }
+
+    Ok(removed_count)
+}
+
+fn remove_stale_journals(
+    journal_dir: &Path,
+    now: SystemTime,
+    failed_ttl: Duration,
+    completed_ttl: Duration,
+) -> Result<(u64, u64)> {
+    if !journal_dir.exists() {
+        return Ok((0, 0));
+    }
+
+    let mut removed_failed = 0;
+    let mut removed_completed = 0;
+
+    for entry in fs::read_dir(journal_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || !is_json_file(&path) {
+            continue;
+        }
+
+        let Some(age) = entry_age(&entry, now) else {
+            continue;
+        };
+
+        let journal = load_journal_or_recover(&path)?;
+        let is_completed = journal
+            .as_ref()
+            .map(|j| {
+                j.items
+                    .iter()
+                    .all(|i| matches!(i.state, JournalItemState::Completed))
+            })
+            .unwrap_or(false);
+
+        if is_completed && age > completed_ttl {
+            fs::remove_file(&path)?;
+            removed_completed += 1;
+        } else if !is_completed && age > failed_ttl {
+            fs::remove_file(&path)?;
+            removed_failed += 1;
+        }
+    }
+
+    Ok((removed_failed, removed_completed))
+}
+
 pub fn cleanup_stale_transient_artefacts(settings: &AppSettings) -> Result<CleanupSummary> {
     if !settings.ollama_library.transient_cleanup_enabled {
         return Ok(CleanupSummary::default());
@@ -462,78 +560,16 @@ pub fn cleanup_stale_transient_artefacts(settings: &AppSettings) -> Result<Clean
     let models_path = expand_models_path(&settings.ollama_library.models_path)?;
     let parts_dir = models_path.join("blobs").join(".parts");
     let transient_ttl = Duration::from_secs(settings.ollama_library.transient_ttl_hours * 3600);
-    if parts_dir.exists() {
-        for entry in fs::read_dir(&parts_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let age_ok = entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|m| now.duration_since(m).ok())
-                .map(|age| age > transient_ttl)
-                .unwrap_or(false);
-
-            if age_ok {
-                fs::remove_file(&path)?;
-                summary.removed_transient_files += 1;
-            }
-        }
-    }
+    summary.removed_transient_files = remove_stale_transient_files(&parts_dir, now, transient_ttl)?;
 
     let journal_dir = get_journal_dir_path().map_err(DownloaderError::IoError)?;
-    if journal_dir.exists() {
-        let failed_ttl =
-            Duration::from_secs(settings.ollama_library.failed_journal_ttl_hours * 3600);
-        let completed_ttl =
-            Duration::from_secs(settings.ollama_library.completed_journal_ttl_hours * 3600);
-
-        for entry in fs::read_dir(&journal_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            if path
-                .extension()
-                .and_then(|v| v.to_str())
-                .map(|ext| ext != "json")
-                .unwrap_or(true)
-            {
-                continue;
-            }
-
-            let age = entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|m| now.duration_since(m).ok());
-            let Some(age) = age else { continue };
-
-            let journal = load_journal_or_recover(&path)?;
-            let is_completed = journal
-                .as_ref()
-                .map(|j| {
-                    j.items
-                        .iter()
-                        .all(|i| matches!(i.state, JournalItemState::Completed))
-                })
-                .unwrap_or(false);
-
-            if is_completed && age > completed_ttl {
-                fs::remove_file(&path)?;
-                summary.removed_completed_journals += 1;
-            } else if !is_completed && age > failed_ttl {
-                fs::remove_file(&path)?;
-                summary.removed_failed_journals += 1;
-            }
-        }
-    }
+    let failed_ttl = Duration::from_secs(settings.ollama_library.failed_journal_ttl_hours * 3600);
+    let completed_ttl =
+        Duration::from_secs(settings.ollama_library.completed_journal_ttl_hours * 3600);
+    let (removed_failed_journals, removed_completed_journals) =
+        remove_stale_journals(&journal_dir, now, failed_ttl, completed_ttl)?;
+    summary.removed_failed_journals = removed_failed_journals;
+    summary.removed_completed_journals = removed_completed_journals;
 
     if summary.removed_transient_files > 0
         || summary.removed_failed_journals > 0
