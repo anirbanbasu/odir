@@ -1568,6 +1568,11 @@ struct ChunkWorker<'a> {
     total_size: u64,
 }
 
+enum ChunkPartOutcome {
+    Completed,
+    Aborted,
+}
+
 impl ChunkWorker<'_> {
     fn wait_if_interrupt_prompt_active(&self) {
         while !self.cancel.load(Ordering::Acquire)
@@ -1597,15 +1602,35 @@ impl ChunkWorker<'_> {
             };
 
             match self.download_one_part(part_idx) {
-                Ok(()) => {
-                    self.parts_done.fetch_add(1, Ordering::AcqRel);
-                    let _ = self.done_tx.send(ChunkCoordinatorEvent::PartDone(part_idx));
+                Ok(outcome) => {
+                    if !self.handle_part_outcome(part_idx, outcome) {
+                        return;
+                    }
                 }
                 Err(e) => {
                     self.set_error_once(e);
                     self.cancel.store(true, Ordering::Release);
                     return;
                 }
+            }
+        }
+    }
+
+    fn handle_part_outcome(&self, part_idx: u64, outcome: ChunkPartOutcome) -> bool {
+        match outcome {
+            ChunkPartOutcome::Completed => {
+                self.parts_done.fetch_add(1, Ordering::AcqRel);
+                let _ = self.done_tx.send(ChunkCoordinatorEvent::PartDone(part_idx));
+                true
+            }
+            ChunkPartOutcome::Aborted => {
+                if self.cancel.load(Ordering::Acquire) || crate::signal_handler::is_interrupted() {
+                    return false;
+                }
+
+                let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                guard.push_front(part_idx);
+                true
             }
         }
     }
@@ -1617,7 +1642,7 @@ impl ChunkWorker<'_> {
         }
     }
 
-    fn download_one_part(&self, part_idx: u64) -> Result<()> {
+    fn download_one_part(&self, part_idx: u64) -> Result<ChunkPartOutcome> {
         self.wait_if_interrupt_prompt_active();
 
         let expected_size =
@@ -1682,7 +1707,7 @@ impl ChunkWorker<'_> {
             self.wait_if_interrupt_prompt_active();
 
             if self.cancel.load(Ordering::Acquire) || crate::signal_handler::is_interrupted() {
-                return Ok(());
+                return Ok(ChunkPartOutcome::Aborted);
             }
 
             let bytes_read = match response.read(&mut buffer) {
@@ -1698,7 +1723,7 @@ impl ChunkWorker<'_> {
                 || crate::signal_handler::interrupt_requested()
                 || crate::signal_handler::interrupt_prompt_active()
             {
-                return Ok(());
+                return Ok(ChunkPartOutcome::Aborted);
             }
 
             out.write_all(&buffer[..bytes_read])
@@ -1715,7 +1740,7 @@ impl ChunkWorker<'_> {
             )));
         }
 
-        Ok(())
+        Ok(ChunkPartOutcome::Completed)
     }
 }
 
@@ -2035,6 +2060,7 @@ fn apply_ownership(path: &Path, ownership: Ownership) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::blocking::Client;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
     use std::{env, fs};
@@ -2057,6 +2083,82 @@ mod tests {
 
     fn reset_interrupt_flag_for_test() {
         crate::signal_handler::INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn make_test_worker(
+        queue: Arc<Mutex<VecDeque<u64>>>,
+        parts_done: Arc<AtomicU64>,
+        cancel: Arc<AtomicBool>,
+        done_tx: mpsc::Sender<ChunkCoordinatorEvent>,
+    ) -> ChunkWorker<'static> {
+        ChunkWorker {
+            client: Client::new(),
+            url: "http://localhost",
+            named_digest: "sha256:test",
+            data_file: PathBuf::from("/tmp/odir-test-part.bin"),
+            queue,
+            bytes_done: Arc::new(AtomicU64::new(0)),
+            parts_done,
+            cancel,
+            first_error: Arc::new(Mutex::new(None)),
+            done_tx,
+            num_parts: 1,
+            chunk_size: 1,
+            total_size: 1,
+        }
+    }
+
+    #[test]
+    fn test_chunk_worker_requeues_aborted_part_when_continuing() {
+        let _guard = interrupt_lock().lock().expect("lock");
+        reset_interrupt_flag_for_test();
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let parts_done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel::<ChunkCoordinatorEvent>();
+        let worker = make_test_worker(
+            Arc::clone(&queue),
+            Arc::clone(&parts_done),
+            Arc::clone(&cancel),
+            done_tx,
+        );
+
+        let should_continue = worker.handle_part_outcome(7, ChunkPartOutcome::Aborted);
+
+        assert!(should_continue);
+        assert_eq!(parts_done.load(Ordering::Acquire), 0);
+        assert_eq!(
+            queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front(),
+            Some(7)
+        );
+        assert!(done_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_chunk_worker_completed_part_signals_done() {
+        let _guard = interrupt_lock().lock().expect("lock");
+        reset_interrupt_flag_for_test();
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let parts_done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel::<ChunkCoordinatorEvent>();
+        let worker = make_test_worker(
+            Arc::clone(&queue),
+            Arc::clone(&parts_done),
+            Arc::clone(&cancel),
+            done_tx,
+        );
+
+        let should_continue = worker.handle_part_outcome(3, ChunkPartOutcome::Completed);
+
+        assert!(should_continue);
+        assert_eq!(parts_done.load(Ordering::Acquire), 1);
+        match done_rx.try_recv() {
+            Ok(ChunkCoordinatorEvent::PartDone(idx)) => assert_eq!(idx, 3),
+            other => panic!("unexpected event: {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]
