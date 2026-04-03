@@ -68,6 +68,8 @@ pub enum JournalItemState {
     Pending,
     Completed,
     Failed,
+    #[serde(rename = "present_unverified")]
+    PresentUnverified,
 }
 
 /// One digest entry tracked in the advisory download journal.

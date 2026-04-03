@@ -221,12 +221,74 @@ pub fn journal_path_for(
 }
 
 pub fn write_journal_atomic(path: &Path, journal: &DownloadJournal) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
     let payload = serde_json::to_vec_pretty(journal)
         .map_err(|e| DownloaderError::Other(format!("Failed to serialize journal: {}", e)))?;
-    fs::write(&temp_path, payload)?;
-    fs::rename(&temp_path, path)?;
+
+    let parent = path.parent().ok_or_else(|| {
+        DownloaderError::Other(format!("Journal path has no parent directory: {:?}", path))
+    })?;
+
+    let mut temp_file = NamedTempFile::new_in(parent).map_err(DownloaderError::IoError)?;
+    temp_file
+        .write_all(&payload)
+        .map_err(DownloaderError::IoError)?;
+    temp_file
+        .as_file_mut()
+        .sync_all()
+        .map_err(DownloaderError::IoError)?;
+
+    let temp_path = temp_file.into_temp_path();
+    replace_file_with_fallback(temp_path.as_ref(), path)?;
     Ok(())
+}
+
+fn replace_file_with_fallback(temp_path: &Path, destination: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, destination).map_err(DownloaderError::IoError)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        if !destination.exists() {
+            fs::rename(temp_path, destination).map_err(DownloaderError::IoError)?;
+            return Ok(());
+        }
+
+        let backup_path = unique_backup_path(destination);
+        fs::rename(destination, &backup_path).map_err(DownloaderError::IoError)?;
+
+        match fs::rename(temp_path, destination) {
+            Ok(()) => {
+                if let Err(e) = fs::remove_file(&backup_path) {
+                    warn!(
+                        "Failed to remove journal backup {:?} after replacement: {}",
+                        backup_path, e
+                    );
+                }
+                Ok(())
+            }
+            Err(rename_err) => {
+                if let Err(restore_err) = fs::rename(&backup_path, destination) {
+                    warn!(
+                        "Failed to restore journal backup {:?} after replacement failure: {}",
+                        backup_path, restore_err
+                    );
+                }
+                Err(DownloaderError::IoError(rename_err))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unique_backup_path(destination: &Path) -> PathBuf {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    destination.with_extension(format!("bak.{}.{}", std::process::id(), now_nanos))
 }
 
 pub fn load_journal_or_recover(path: &Path) -> Result<Option<DownloadJournal>> {
@@ -277,8 +339,26 @@ pub fn initialize_or_reconcile_journal(
             .join("blobs")
             .join(item.digest.replace(':', "-"));
         if blob_path.exists() {
-            item.state = JournalItemState::Completed;
-            item.last_error = None;
+            match verify_blob_file_digest(&blob_path, &item.digest) {
+                Ok(true) => {
+                    item.state = JournalItemState::Completed;
+                    item.last_error = None;
+                }
+                Ok(false) => {
+                    item.state = JournalItemState::PresentUnverified;
+                    warn!(
+                        "Blob exists but digest verification failed for {:?}; marking as present_unverified",
+                        blob_path
+                    );
+                }
+                Err(e) => {
+                    item.state = JournalItemState::PresentUnverified;
+                    warn!(
+                        "Failed to verify digest for existing blob {:?}: {}. Marking as present_unverified",
+                        blob_path, e
+                    );
+                }
+            }
         }
     }
 
@@ -1679,7 +1759,7 @@ impl ChunkWorker<'_> {
             .unwrap_or("unknown");
         // Log HTTP status and headers at debug level via the coordinator's
         // pb.println() path so the message appears cleanly above the progress bar.
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let debug_line = format!(
                 "[Part {}/{}] GET {} (Content-Type: {}, Content-Length: {})",
                 part_idx + 1,
@@ -2245,6 +2325,121 @@ mod tests {
         fs::write(&path, "{not-json").expect("write corrupt journal");
         let recovered = load_journal_or_recover(&path).expect("recover corrupt");
         assert!(recovered.is_none());
+    }
+
+    #[test]
+    fn test_write_journal_atomic_overwrites_existing_file() {
+        let td = tempdir().expect("tempdir");
+        let journal_path = td.path().join("journal.json");
+
+        let first = DownloadJournal {
+            model_identifier: "model-a:q4".to_string(),
+            source_type: DownloadSourceType::Ollama,
+            tag_or_quant: "q4".to_string(),
+            started_at: 1,
+            updated_at: 2,
+            items: vec![DownloadJournalItem {
+                digest: "sha256:abc".to_string(),
+                media_type: "application/test".to_string(),
+                size: 10,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+        };
+        write_journal_atomic(&journal_path, &first).expect("write first journal");
+
+        let second = DownloadJournal {
+            model_identifier: "model-b:q8".to_string(),
+            source_type: DownloadSourceType::Hf,
+            tag_or_quant: "q8".to_string(),
+            started_at: 11,
+            updated_at: 12,
+            items: vec![DownloadJournalItem {
+                digest: "sha256:def".to_string(),
+                media_type: "application/test".to_string(),
+                size: 20,
+                state: JournalItemState::Completed,
+                last_error: None,
+            }],
+        };
+        write_journal_atomic(&journal_path, &second).expect("overwrite journal");
+
+        let loaded = load_journal_or_recover(&journal_path)
+            .expect("load overwritten journal")
+            .expect("journal should exist");
+
+        assert_eq!(loaded.model_identifier, "model-b:q8");
+        assert!(matches!(loaded.source_type, DownloadSourceType::Hf));
+        assert_eq!(loaded.items.len(), 1);
+        assert!(matches!(loaded.items[0].state, JournalItemState::Completed));
+    }
+
+    #[test]
+    fn test_journal_reconcile_marks_present_unverified_for_invalid_existing_blob() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let models_root = td.path().join("models");
+        let blobs_dir = models_root.join("blobs");
+        fs::create_dir_all(&blobs_dir).expect("create blobs dir");
+
+        let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let blob_path = blobs_dir.join(digest.replace(':', "-"));
+        fs::write(&blob_path, b"corrupt-bytes").expect("write invalid blob");
+
+        let model = "invalid-existing-blob:latest";
+        let (journal_path, _first_journal) = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "latest",
+            vec![DownloadJournalItem {
+                digest: digest.to_string(),
+                media_type: "application/test".to_string(),
+                size: 10,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("init journal with invalid blob present");
+
+        let mut existing = load_journal_or_recover(&journal_path)
+            .expect("load journal")
+            .expect("journal should exist");
+        update_journal_item_state(
+            &mut existing,
+            digest,
+            JournalItemState::Failed,
+            Some("network timeout".to_string()),
+        );
+        write_journal_atomic(&journal_path, &existing).expect("persist failed state");
+
+        let (_, reconciled) = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "latest",
+            vec![DownloadJournalItem {
+                digest: digest.to_string(),
+                media_type: "application/test".to_string(),
+                size: 10,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("reconcile should mark invalid existing blob as present_unverified");
+
+        assert!(matches!(
+            reconciled.items[0].state,
+            JournalItemState::PresentUnverified
+        ));
+        assert_eq!(
+            reconciled.items[0].last_error.as_deref(),
+            Some("network timeout")
+        );
     }
 
     #[test]

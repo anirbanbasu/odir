@@ -2,12 +2,88 @@
 
 mod common;
 
-use directories::ProjectDirs;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
+
+struct TestSandbox {
+    _root: TempDir,
+    home_dir: PathBuf,
+    xdg_data_home: PathBuf,
+}
+
+impl TestSandbox {
+    fn new() -> Self {
+        let root = TempDir::new().expect("create temp test dir");
+        let home_dir = root.path().join("home");
+        let xdg_data_home = root.path().join("xdg-data");
+
+        fs::create_dir_all(&home_dir).expect("create sandbox home");
+        fs::create_dir_all(&xdg_data_home).expect("create sandbox XDG data dir");
+
+        Self {
+            _root: root,
+            home_dir,
+            xdg_data_home,
+        }
+    }
+
+    fn apply_env(&self, command: &mut Command) {
+        command.env("HOME", &self.home_dir);
+        command.env("XDG_DATA_HOME", &self.xdg_data_home);
+
+        #[cfg(target_os = "windows")]
+        {
+            command.env("USERPROFILE", &self.home_dir);
+            command.env("LOCALAPPDATA", self.home_dir.join("AppData").join("Local"));
+            command.env("APPDATA", self.home_dir.join("AppData").join("Roaming"));
+        }
+    }
+
+    fn journal_dir(&self) -> PathBuf {
+        let data_local_dir = self.platform_data_local_dir();
+        let journal_dir = data_local_dir.join("journals");
+        fs::create_dir_all(&journal_dir).expect("create journals dir");
+        journal_dir
+    }
+
+    fn platform_data_local_dir(&self) -> PathBuf {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "android"
+        ))]
+        {
+            return self.xdg_data_home.join("odir");
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            return self
+                .home_dir
+                .join("Library")
+                .join("Application Support")
+                .join("odir");
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            return self
+                .home_dir
+                .join("AppData")
+                .join("Local")
+                .join("odir")
+                .join("data");
+        }
+    }
+}
 
 fn unique_model_identifier() -> String {
     let ts = SystemTime::now()
@@ -17,10 +93,8 @@ fn unique_model_identifier() -> String {
     format!("journal-test-{}:q4", ts)
 }
 
-fn journal_path_for_ollama(model_identifier: &str) -> std::path::PathBuf {
-    let proj_dirs = ProjectDirs::from("", "", "odir").expect("project dirs");
-    let journal_dir = proj_dirs.data_local_dir().join("journals");
-    fs::create_dir_all(&journal_dir).expect("create journals dir");
+fn journal_path_for_ollama(sandbox: &TestSandbox, model_identifier: &str) -> std::path::PathBuf {
+    let journal_dir = sandbox.journal_dir();
 
     let mut hasher = Sha256::new();
     hasher.update(b"ollama");
@@ -90,11 +164,14 @@ fn write_completed_test_journal(path: &std::path::Path, model_identifier: &str) 
 
 #[test]
 fn test_journal_display_includes_completed_percentage() {
+    let sandbox = TestSandbox::new();
     let model_identifier = unique_model_identifier();
-    let journal_path = journal_path_for_ollama(&model_identifier);
+    let journal_path = journal_path_for_ollama(&sandbox, &model_identifier);
     write_test_journal(&journal_path, &model_identifier);
 
-    let output = Command::new(common::get_binary_path())
+    let mut cmd = Command::new(common::get_binary_path());
+    sandbox.apply_env(&mut cmd);
+    let output = cmd
         .args(["journal", &model_identifier, "--source", "ollama"])
         .output()
         .expect("run odir journal");
@@ -121,21 +198,22 @@ fn test_journal_display_includes_completed_percentage() {
         combined
     );
     assert!(
-        combined.contains("Updated At:") && combined.contains("+"),
-        "Expected human-readable Updated At timestamp in output: {}",
+        combined.contains("Updated At:") && (combined.contains('+') || combined.contains('-')),
+        "Expected human-readable Updated At timestamp with timezone offset in output: {}",
         combined
     );
-
-    let _ = fs::remove_file(journal_path);
 }
 
 #[test]
 fn test_journal_clear_completed_uses_safe_clear_message() {
+    let sandbox = TestSandbox::new();
     let model_identifier = unique_model_identifier();
-    let journal_path = journal_path_for_ollama(&model_identifier);
+    let journal_path = journal_path_for_ollama(&sandbox, &model_identifier);
     write_completed_test_journal(&journal_path, &model_identifier);
 
-    let mut child = Command::new(common::get_binary_path())
+    let mut cmd = Command::new(common::get_binary_path());
+    sandbox.apply_env(&mut cmd);
+    let mut child = cmd
         .args([
             "journal",
             &model_identifier,
@@ -182,17 +260,18 @@ fn test_journal_clear_completed_uses_safe_clear_message() {
         journal_path.exists(),
         "Journal file should remain when default answer is No"
     );
-
-    let _ = fs::remove_file(journal_path);
 }
 
 #[test]
 fn test_journal_clear_default_no_keeps_journal() {
+    let sandbox = TestSandbox::new();
     let model_identifier = unique_model_identifier();
-    let journal_path = journal_path_for_ollama(&model_identifier);
+    let journal_path = journal_path_for_ollama(&sandbox, &model_identifier);
     write_test_journal(&journal_path, &model_identifier);
 
-    let mut child = Command::new(common::get_binary_path())
+    let mut cmd = Command::new(common::get_binary_path());
+    sandbox.apply_env(&mut cmd);
+    let mut child = cmd
         .args([
             "journal",
             &model_identifier,
@@ -239,6 +318,4 @@ fn test_journal_clear_default_no_keeps_journal() {
         journal_path.exists(),
         "Journal file should remain when default answer is No"
     );
-
-    let _ = fs::remove_file(journal_path);
 }
