@@ -1143,7 +1143,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "signal-hook 0.4.3",
+ "signal-hook 0.4.4",
  "tempfile",
  "thiserror 2.0.18",
  "url",
@@ -1812,9 +1812,9 @@ dependencies = [
 
 [[package]]
 name = "signal-hook"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b57709da74f9ff9f4a27dce9526eec25ca8407c45a7887243b031a58935fb8e"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
 dependencies = [
  "libc",
  "signal-hook-registry",
