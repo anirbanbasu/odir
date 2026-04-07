@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [unreleased] [0.1.1]
+## [unreleased]
+
+This set of changes will constitute the next release, which will be version [0.1.1].
 
 ### Added
 
