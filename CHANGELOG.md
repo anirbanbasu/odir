@@ -4,12 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [unreleased]
+## [unreleased] [0.1.1]
 
 ### Added
 
 - Improved coverage but this is still ongoing.
 - Added support for chunked downloading of large model blobs, which makes downloads more robust over unreliable connections.
+- Added support for resuming multi-layer models downloads, which can be interrupted (intentionally or not) and resumed without starting over.
+- Added a new `journal` command to view the status of succeeded, pending, and failed downloads.
 
 ### Changed
 
@@ -53,5 +55,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 - Added Open Source Vulnerability (OSV) analysis.
 
 
-[unreleased]: https://github.com/anirbanbasu/odir/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/anirbanbasu/odir/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/anirbanbasu/odir/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/anirbanbasu/odir/compare/v0.0.1...v0.1.0

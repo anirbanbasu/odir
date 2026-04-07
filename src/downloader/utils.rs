@@ -554,6 +554,15 @@ fn is_json_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn remove_file_ignore_not_found(path: &Path) -> Result<()> {
+    if let Err(e) = fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(DownloaderError::IoError(e));
+    }
+    Ok(())
+}
+
 fn remove_stale_transient_files(
     parts_dir: &Path,
     now: SystemTime,
@@ -618,18 +627,10 @@ fn remove_stale_journals(
             .all(|i| matches!(i.state, JournalItemState::Completed));
 
         if is_completed && age > completed_ttl {
-            if let Err(e) = fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(DownloaderError::IoError(e));
-            }
+            remove_file_ignore_not_found(&path)?;
             removed_completed += 1;
         } else if !is_completed && age > failed_ttl {
-            if let Err(e) = fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(DownloaderError::IoError(e));
-            }
+            remove_file_ignore_not_found(&path)?;
             removed_failed += 1;
         }
     }
