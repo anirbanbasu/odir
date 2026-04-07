@@ -1,8 +1,16 @@
 //! Utility functions for the Ollama Downloader in Rust (ODIR),
 //! including model presence checks, downloading blobs, saving manifests,
 //! and cleaning up temporary files.
-use crate::downloader::model_downloader::{DownloaderError, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::downloader::model_downloader::{
+    DownloaderError, Result, http_status_error_from_response,
+};
+use crate::{
+    config::{AppSettings, get_journal_dir_path},
+    downloader::manifest::{
+        DownloadJournal, DownloadJournalItem, DownloadSourceType, JournalItemState,
+    },
+};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{debug, error, info, warn};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -11,14 +19,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::env;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 /// Check if a model is present in the Ollama server.
@@ -45,9 +56,7 @@ pub fn is_model_present_in_ollama(
     let response = client.get(&tags_url).send()?;
 
     if !response.status().is_success() {
-        return Err(DownloaderError::HttpError(
-            response.error_for_status().unwrap_err(),
-        ));
+        return Err(http_status_error_from_response(response));
     }
 
     let tags_response: Value = response.json()?;
@@ -153,6 +162,517 @@ pub fn warn_if_models_path_requires_root(models_path: &str, is_download: bool) {
             }
         }
     }
+}
+
+pub fn blob_path_from_digest(models_path: &str, named_digest: &str) -> Result<PathBuf> {
+    let models_root = expand_models_path(models_path)?;
+    Ok(models_root
+        .join("blobs")
+        .join(named_digest.replace(':', "-")))
+}
+
+pub fn verify_blob_file_digest(blob_path: &Path, named_digest: &str) -> Result<bool> {
+    if !blob_path.exists() {
+        return Ok(false);
+    }
+    let expected = named_digest.strip_prefix("sha256:").ok_or_else(|| {
+        DownloaderError::Other(format!("Unsupported digest format: {}", named_digest))
+    })?;
+
+    let computed = compute_file_sha256_no_progress(blob_path)?;
+    Ok(computed == expected)
+}
+
+pub fn remove_blob_if_invalid(models_path: &str, named_digest: &str) -> Result<()> {
+    let blob_path = blob_path_from_digest(models_path, named_digest)?;
+    if !blob_path.exists() {
+        return Ok(());
+    }
+
+    if !verify_blob_file_digest(&blob_path, named_digest)? {
+        warn!(
+            "Existing blob {:?} is invalid for digest {}; removing it",
+            blob_path, named_digest
+        );
+        fs::remove_file(blob_path)?;
+    }
+    Ok(())
+}
+
+fn journal_file_name(source_type: &DownloadSourceType, model_identifier: &str) -> String {
+    let source = match source_type {
+        DownloadSourceType::Ollama => "ollama",
+        DownloadSourceType::Hf => "hf",
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hasher.update(b"::");
+    hasher.update(model_identifier.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("{}_{}.json", source, digest)
+}
+
+pub fn journal_path_for(
+    source_type: &DownloadSourceType,
+    model_identifier: &str,
+) -> Result<PathBuf> {
+    let journal_dir = get_journal_dir_path().map_err(DownloaderError::IoError)?;
+    Ok(journal_dir.join(journal_file_name(source_type, model_identifier)))
+}
+
+pub fn write_journal_atomic(path: &Path, journal: &DownloadJournal) -> Result<()> {
+    let payload = serde_json::to_vec_pretty(journal)
+        .map_err(|e| DownloaderError::Other(format!("Failed to serialize journal: {}", e)))?;
+
+    let parent = path.parent().ok_or_else(|| {
+        DownloaderError::Other(format!("Journal path has no parent directory: {:?}", path))
+    })?;
+
+    let mut temp_file = NamedTempFile::new_in(parent).map_err(DownloaderError::IoError)?;
+    temp_file
+        .write_all(&payload)
+        .map_err(DownloaderError::IoError)?;
+    temp_file
+        .as_file_mut()
+        .sync_all()
+        .map_err(DownloaderError::IoError)?;
+
+    let temp_path = temp_file.into_temp_path();
+    replace_file_with_fallback(temp_path.as_ref(), path)?;
+    Ok(())
+}
+
+fn replace_file_with_fallback(temp_path: &Path, destination: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, destination).map_err(DownloaderError::IoError)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        if !destination.exists() {
+            fs::rename(temp_path, destination).map_err(DownloaderError::IoError)?;
+            return Ok(());
+        }
+
+        let backup_path = unique_backup_path(destination);
+        fs::rename(destination, &backup_path).map_err(DownloaderError::IoError)?;
+
+        match fs::rename(temp_path, destination) {
+            Ok(()) => {
+                if let Err(e) = fs::remove_file(&backup_path) {
+                    warn!(
+                        "Failed to remove journal backup {:?} after replacement: {}",
+                        backup_path, e
+                    );
+                }
+                Ok(())
+            }
+            Err(rename_err) => {
+                if let Err(restore_err) = fs::rename(&backup_path, destination) {
+                    warn!(
+                        "Failed to restore journal backup {:?} after replacement failure: {}",
+                        backup_path, restore_err
+                    );
+                }
+                Err(DownloaderError::IoError(rename_err))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unique_backup_path(destination: &Path) -> PathBuf {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    destination.with_extension(format!("bak.{}.{}", std::process::id(), now_nanos))
+}
+
+pub fn load_journal_or_recover(path: &Path) -> Result<Option<DownloadJournal>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(path)?;
+    match serde_json::from_str::<DownloadJournal>(&raw) {
+        Ok(journal) => Ok(Some(journal)),
+        Err(e) => {
+            let ts = now_epoch_seconds();
+            let corrupt_path = path.with_extension(format!("corrupt.{}", ts));
+            fs::rename(path, &corrupt_path)?;
+            warn!(
+                "Journal {:?} is malformed ({}). Renamed to {:?}",
+                path, e, corrupt_path
+            );
+            Ok(None)
+        }
+    }
+}
+
+pub fn initialize_or_reconcile_journal(
+    source_type: DownloadSourceType,
+    model_identifier: &str,
+    tag_or_quant: &str,
+    mut items: Vec<DownloadJournalItem>,
+    models_path: &str,
+) -> Result<(PathBuf, DownloadJournal)> {
+    let path = journal_path_for(&source_type, model_identifier)?;
+    let now = now_epoch_seconds();
+
+    let mut started_at = now;
+    if let Some(existing) = load_journal_or_recover(&path)? {
+        started_at = existing.started_at;
+        for item in &mut items {
+            if let Some(found) = existing.items.iter().find(|e| e.digest == item.digest) {
+                item.state = found.state.clone();
+                item.last_error = found.last_error.clone();
+            }
+        }
+    }
+
+    let models_root = expand_models_path(models_path)?;
+    for item in &mut items {
+        let blob_path = models_root
+            .join("blobs")
+            .join(item.digest.replace(':', "-"));
+        if blob_path.exists() {
+            match verify_blob_file_digest(&blob_path, &item.digest) {
+                Ok(true) => {
+                    item.state = JournalItemState::Completed;
+                    item.last_error = None;
+                }
+                Ok(false) => {
+                    item.state = JournalItemState::PresentUnverified;
+                    warn!(
+                        "Blob exists but digest verification failed for {:?}; marking as present_unverified",
+                        blob_path
+                    );
+                }
+                Err(e) => {
+                    item.state = JournalItemState::PresentUnverified;
+                    warn!(
+                        "Failed to verify digest for existing blob {:?}: {}. Marking as present_unverified",
+                        blob_path, e
+                    );
+                }
+            }
+        }
+    }
+
+    let journal = DownloadJournal {
+        model_identifier: model_identifier.to_string(),
+        source_type,
+        tag_or_quant: tag_or_quant.to_string(),
+        started_at,
+        updated_at: now,
+        items,
+    };
+
+    write_journal_atomic(&path, &journal)?;
+    Ok((path, journal))
+}
+
+pub fn update_journal_item_state(
+    journal: &mut DownloadJournal,
+    digest: &str,
+    state: JournalItemState,
+    last_error: Option<String>,
+) {
+    if let Some(item) = journal.items.iter_mut().find(|i| i.digest == digest) {
+        item.state = state;
+        item.last_error = last_error;
+        journal.updated_at = now_epoch_seconds();
+    }
+}
+
+fn now_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn load_journal_for_model(
+    model_identifier: &str,
+    source_hint: Option<DownloadSourceType>,
+) -> Result<DownloadJournal> {
+    let (_, journal) = find_journal_for_model(model_identifier, source_hint)?;
+    Ok(journal)
+}
+
+fn find_journal_for_model(
+    model_identifier: &str,
+    source_hint: Option<DownloadSourceType>,
+) -> Result<(PathBuf, DownloadJournal)> {
+    let candidates = match source_hint {
+        Some(source) => vec![source],
+        None => vec![DownloadSourceType::Ollama, DownloadSourceType::Hf],
+    };
+
+    let mut found: Vec<(PathBuf, DownloadJournal)> = Vec::new();
+    for source in candidates {
+        let path = journal_path_for(&source, model_identifier)?;
+        if let Some(journal) = load_journal_or_recover(&path)? {
+            found.push((path, journal));
+        }
+    }
+
+    if found.is_empty() {
+        return Err(DownloaderError::Other(format!(
+            "No journal found for model '{}'",
+            model_identifier
+        )));
+    }
+
+    found.sort_by_key(|(_, j)| j.updated_at);
+    Ok(found.pop().expect("found is non-empty"))
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JournalClearSummary {
+    pub removed_partial_files: u64,
+    pub removed_journal: bool,
+    pub had_completed_download: bool,
+}
+
+fn remove_partial_files_for_journal(journal: &DownloadJournal, models_path: &str) -> Result<u64> {
+    let models_root = expand_models_path(models_path)?;
+    let parts_root = models_root.join("blobs").join(".parts");
+    if !parts_root.exists() {
+        return Ok(0);
+    }
+
+    let mut removed_partial_files = 0;
+    for item in &journal.items {
+        let stem = item.digest.replace(':', "-");
+        let candidates = [
+            parts_root.join(format!("{}.bin", stem)),
+            parts_root.join(format!("{}.state.json", stem)),
+            parts_root.join(format!("{}.state.tmp", stem)),
+            parts_root.join(format!("{}.state.bak", stem)),
+        ];
+
+        for path in candidates {
+            if path.exists() {
+                fs::remove_file(&path)?;
+                removed_partial_files += 1;
+            }
+        }
+    }
+
+    Ok(removed_partial_files)
+}
+
+pub fn clear_journal_for_model(
+    model_identifier: &str,
+    source: DownloadSourceType,
+    models_path: &str,
+) -> Result<JournalClearSummary> {
+    let (journal_path, journal) = find_journal_for_model(model_identifier, Some(source.clone()))?;
+
+    let mut summary = JournalClearSummary::default();
+    let is_completed = journal
+        .items
+        .iter()
+        .all(|i| matches!(i.state, JournalItemState::Completed));
+    summary.had_completed_download = is_completed;
+
+    if !is_completed {
+        summary.removed_partial_files = remove_partial_files_for_journal(&journal, models_path)?;
+    }
+
+    if journal_path.exists() {
+        fs::remove_file(journal_path)?;
+        summary.removed_journal = true;
+    }
+
+    Ok(summary)
+}
+
+pub fn list_available_journals(
+    source_hint: Option<DownloadSourceType>,
+) -> Result<Vec<DownloadJournal>> {
+    let journal_dir = get_journal_dir_path().map_err(DownloaderError::IoError)?;
+    let mut journals = Vec::new();
+
+    if !journal_dir.exists() {
+        return Ok(journals);
+    }
+
+    for entry in fs::read_dir(&journal_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|v| v.to_str())
+            .map(|ext| ext != "json")
+            .unwrap_or(true)
+        {
+            continue;
+        }
+
+        if let Some(journal) = load_journal_or_recover(&path)? {
+            if let Some(filter) = source_hint.as_ref()
+                && &journal.source_type != filter
+            {
+                continue;
+            }
+            journals.push(journal);
+        }
+    }
+
+    journals.sort_by_key(|j| j.updated_at);
+    journals.reverse();
+    Ok(journals)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CleanupSummary {
+    pub removed_transient_files: u64,
+    pub removed_failed_journals: u64,
+    pub removed_completed_journals: u64,
+}
+
+fn entry_age(entry: &fs::DirEntry, now: SystemTime) -> Option<Duration> {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| now.duration_since(m).ok())
+}
+
+fn is_json_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|v| v.to_str())
+        .map(|ext| ext == "json")
+        .unwrap_or(false)
+}
+
+fn remove_file_ignore_not_found(path: &Path) -> Result<()> {
+    if let Err(e) = fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(DownloaderError::IoError(e));
+    }
+    Ok(())
+}
+
+fn remove_stale_transient_files(
+    parts_dir: &Path,
+    now: SystemTime,
+    transient_ttl: Duration,
+) -> Result<u64> {
+    if !parts_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed_count = 0;
+    for entry in fs::read_dir(parts_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let age_ok = entry_age(&entry, now)
+            .map(|age| age > transient_ttl)
+            .unwrap_or(false);
+        if age_ok {
+            fs::remove_file(&path)?;
+            removed_count += 1;
+        }
+    }
+
+    Ok(removed_count)
+}
+
+fn remove_stale_journals(
+    journal_dir: &Path,
+    now: SystemTime,
+    failed_ttl: Duration,
+    completed_ttl: Duration,
+) -> Result<(u64, u64)> {
+    if !journal_dir.exists() {
+        return Ok((0, 0));
+    }
+
+    let mut removed_failed = 0;
+    let mut removed_completed = 0;
+
+    for entry in fs::read_dir(journal_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || !is_json_file(&path) {
+            continue;
+        }
+
+        let Some(age) = entry_age(&entry, now) else {
+            continue;
+        };
+
+        let Some(journal) = load_journal_or_recover(&path)? else {
+            // load_journal_or_recover may rename malformed JSON away and return None.
+            // Skip TTL deletion for this entry because the original path may no longer exist.
+            continue;
+        };
+        let is_completed = journal
+            .items
+            .iter()
+            .all(|i| matches!(i.state, JournalItemState::Completed));
+
+        if is_completed && age > completed_ttl {
+            remove_file_ignore_not_found(&path)?;
+            removed_completed += 1;
+        } else if !is_completed && age > failed_ttl {
+            remove_file_ignore_not_found(&path)?;
+            removed_failed += 1;
+        }
+    }
+
+    Ok((removed_failed, removed_completed))
+}
+
+pub fn cleanup_stale_transient_artefacts(settings: &AppSettings) -> Result<CleanupSummary> {
+    if !settings.ollama_library.transient_cleanup_enabled {
+        return Ok(CleanupSummary::default());
+    }
+
+    let mut summary = CleanupSummary::default();
+    let now = SystemTime::now();
+
+    let models_path = expand_models_path(&settings.ollama_library.models_path)?;
+    let parts_dir = models_path.join("blobs").join(".parts");
+    let transient_ttl = Duration::from_secs(settings.ollama_library.transient_ttl_hours * 3600);
+    summary.removed_transient_files = remove_stale_transient_files(&parts_dir, now, transient_ttl)?;
+
+    let journal_dir = get_journal_dir_path().map_err(DownloaderError::IoError)?;
+    let failed_ttl = Duration::from_secs(settings.ollama_library.failed_journal_ttl_hours * 3600);
+    let completed_ttl =
+        Duration::from_secs(settings.ollama_library.completed_journal_ttl_hours * 3600);
+    let (removed_failed_journals, removed_completed_journals) =
+        remove_stale_journals(&journal_dir, now, failed_ttl, completed_ttl)?;
+    summary.removed_failed_journals = removed_failed_journals;
+    summary.removed_completed_journals = removed_completed_journals;
+
+    if summary.removed_transient_files > 0
+        || summary.removed_failed_journals > 0
+        || summary.removed_completed_journals > 0
+    {
+        info!(
+            "Cleanup summary: removed {} transient file(s), {} failed journal(s), {} completed journal(s)",
+            summary.removed_transient_files,
+            summary.removed_failed_journals,
+            summary.removed_completed_journals
+        );
+    }
+
+    Ok(summary)
 }
 
 fn is_running_as_root() -> bool {
@@ -343,6 +863,13 @@ fn log_single_stream_fallback(range_supported: bool, total_size: u64, named_dige
     }
 }
 
+fn new_progress_bar(total_size: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total_size);
+    // Draw progress on stdout; env_logger writes to stderr, keeping the two streams separate.
+    pb.set_draw_target(ProgressDrawTarget::stdout());
+    pb
+}
+
 fn download_model_blob_single_stream(
     client: &Client,
     url: &str,
@@ -358,14 +885,12 @@ fn download_model_blob_single_stream(
     let response = client.get(url).send()?;
 
     if !response.status().is_success() {
-        return Err(DownloaderError::HttpError(
-            response.error_for_status().unwrap_err(),
-        ));
+        return Err(http_status_error_from_response(response));
     }
 
     let total_size = response.content_length().unwrap_or(0);
 
-    let pb = ProgressBar::new(total_size);
+    let pb = new_progress_bar(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -584,7 +1109,7 @@ fn download_model_blob_chunked(request: ChunkedBlobDownload<'_>) -> Result<(Path
     log_scan_summary(named_digest, num_parts, &scan);
 
     // Progress bar covering the full file, pre-advanced for already-downloaded bytes.
-    let pb = ProgressBar::new(total_size);
+    let pb = new_progress_bar(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -864,6 +1389,11 @@ struct DownloadChunksParallelRequest<'a> {
     download_chunks_in_parallel: bool,
 }
 
+enum ChunkCoordinatorEvent {
+    PartDone(u64),
+    DebugLine(String),
+}
+
 /// Checks signal-handler interrupt flags and, if warranted, prompts the user.
 /// Stores `true` into `cancel` and returns `true` when the coordinator should abort.
 fn check_chunk_interrupt(cancel: &AtomicBool, pb: &ProgressBar, parts_done: &AtomicU64) -> bool {
@@ -937,7 +1467,7 @@ fn update_chunk_progress(
 }
 
 struct CoordinatorLoopParams<'a> {
-    done_rx: &'a mpsc::Receiver<u64>,
+    done_rx: &'a mpsc::Receiver<ChunkCoordinatorEvent>,
     cancel: &'a AtomicBool,
     first_error: &'a Mutex<Option<DownloaderError>>,
     bytes_done: &'a AtomicU64,
@@ -977,7 +1507,7 @@ fn run_coordinator_loop(p: CoordinatorLoopParams<'_>) -> (bool, usize) {
         }
 
         match p.done_rx.recv_timeout(refresh_interval) {
-            Ok(part_idx) => {
+            Ok(ChunkCoordinatorEvent::PartDone(part_idx)) => {
                 if on_chunk_completed(
                     part_idx,
                     p.state,
@@ -989,6 +1519,11 @@ fn run_coordinator_loop(p: CoordinatorLoopParams<'_>) -> (bool, usize) {
                 ) {
                     break;
                 }
+            }
+            Ok(ChunkCoordinatorEvent::DebugLine(line)) => {
+                // pb.println() prints a stable line above the live progress bar
+                // without corrupting its redraw cycle.
+                p.pb.println(line);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1041,7 +1576,7 @@ fn download_missing_chunks_parallel(request: DownloadChunksParallelRequest<'_>) 
     let parts_done = Arc::new(AtomicU64::new(completed_parts));
     let cancel = Arc::new(AtomicBool::new(false));
     let first_error = Arc::new(Mutex::new(None::<DownloaderError>));
-    let (done_tx, done_rx) = mpsc::channel::<u64>();
+    let (done_tx, done_rx) = mpsc::channel::<ChunkCoordinatorEvent>();
 
     let mut user_aborted = false;
     let mut finished_missing: usize = 0;
@@ -1116,15 +1651,32 @@ struct ChunkWorker<'a> {
     parts_done: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     first_error: Arc<Mutex<Option<DownloaderError>>>,
-    done_tx: mpsc::Sender<u64>,
+    done_tx: mpsc::Sender<ChunkCoordinatorEvent>,
     num_parts: u64,
     chunk_size: u64,
     total_size: u64,
 }
 
+enum ChunkPartOutcome {
+    Completed,
+    Aborted,
+}
+
 impl ChunkWorker<'_> {
+    fn wait_if_interrupt_prompt_active(&self) {
+        while !self.cancel.load(Ordering::Acquire)
+            && !crate::signal_handler::is_interrupted()
+            && (crate::signal_handler::interrupt_requested()
+                || crate::signal_handler::interrupt_prompt_active())
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn run(self) {
         loop {
+            self.wait_if_interrupt_prompt_active();
+
             if self.cancel.load(Ordering::Acquire) || crate::signal_handler::is_interrupted() {
                 return;
             }
@@ -1139,15 +1691,35 @@ impl ChunkWorker<'_> {
             };
 
             match self.download_one_part(part_idx) {
-                Ok(()) => {
-                    self.parts_done.fetch_add(1, Ordering::AcqRel);
-                    let _ = self.done_tx.send(part_idx);
+                Ok(outcome) => {
+                    if !self.handle_part_outcome(part_idx, outcome) {
+                        return;
+                    }
                 }
                 Err(e) => {
                     self.set_error_once(e);
                     self.cancel.store(true, Ordering::Release);
                     return;
                 }
+            }
+        }
+    }
+
+    fn handle_part_outcome(&self, part_idx: u64, outcome: ChunkPartOutcome) -> bool {
+        match outcome {
+            ChunkPartOutcome::Completed => {
+                self.parts_done.fetch_add(1, Ordering::AcqRel);
+                let _ = self.done_tx.send(ChunkCoordinatorEvent::PartDone(part_idx));
+                true
+            }
+            ChunkPartOutcome::Aborted => {
+                if self.cancel.load(Ordering::Acquire) || crate::signal_handler::is_interrupted() {
+                    return false;
+                }
+
+                let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                guard.push_front(part_idx);
+                true
             }
         }
     }
@@ -1159,7 +1731,9 @@ impl ChunkWorker<'_> {
         }
     }
 
-    fn download_one_part(&self, part_idx: u64) -> Result<()> {
+    fn download_one_part(&self, part_idx: u64) -> Result<ChunkPartOutcome> {
+        self.wait_if_interrupt_prompt_active();
+
         let expected_size =
             expected_part_size(part_idx, self.num_parts, self.total_size, self.chunk_size);
         let range_start = part_idx * self.chunk_size;
@@ -1181,6 +1755,33 @@ impl ChunkWorker<'_> {
             )));
         }
 
+        // Log HTTP status and headers at debug level
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        // Log HTTP status and headers at debug level via the coordinator's
+        // pb.println() path so the message appears cleanly above the progress bar.
+        if log::log_enabled!(log::Level::Debug) {
+            let debug_line = format!(
+                "[Part {}/{}] GET {} (Content-Type: {}, Content-Length: {})",
+                part_idx + 1,
+                self.num_parts,
+                response.status(),
+                content_type,
+                content_length
+            );
+            let _ = self
+                .done_tx
+                .send(ChunkCoordinatorEvent::DebugLine(debug_line));
+        }
+
         let mut out = fs::OpenOptions::new()
             .write(true)
             .open(&self.data_file)
@@ -1192,8 +1793,10 @@ impl ChunkWorker<'_> {
         let mut buffer = vec![0u8; CHUNK_IO_BUFFER_SIZE];
 
         loop {
+            self.wait_if_interrupt_prompt_active();
+
             if self.cancel.load(Ordering::Acquire) || crate::signal_handler::is_interrupted() {
-                return Ok(());
+                return Ok(ChunkPartOutcome::Aborted);
             }
 
             let bytes_read = match response.read(&mut buffer) {
@@ -1201,6 +1804,16 @@ impl ChunkWorker<'_> {
                 Ok(n) => n,
                 Err(e) => return Err(DownloaderError::IoError(e)),
             };
+
+            // If Ctrl+C confirmation is in progress (or cancellation was requested),
+            // stop early so workers do not keep advancing visibly behind the prompt.
+            if self.cancel.load(Ordering::Acquire)
+                || crate::signal_handler::is_interrupted()
+                || crate::signal_handler::interrupt_requested()
+                || crate::signal_handler::interrupt_prompt_active()
+            {
+                return Ok(ChunkPartOutcome::Aborted);
+            }
 
             out.write_all(&buffer[..bytes_read])
                 .map_err(DownloaderError::IoError)?;
@@ -1216,7 +1829,7 @@ impl ChunkWorker<'_> {
             )));
         }
 
-        Ok(())
+        Ok(ChunkPartOutcome::Completed)
     }
 }
 
@@ -1228,7 +1841,7 @@ fn compute_file_sha256(path: &Path, named_digest: &str) -> Result<String> {
 
     info!("Verifying downloaded BLOB {}", named_digest);
 
-    let pb = ProgressBar::new(total_size);
+    let pb = new_progress_bar(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -1247,6 +1860,35 @@ fn compute_file_sha256(path: &Path, named_digest: &str) -> Result<String> {
     }
 
     pb.finish_with_message("Verified");
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn compute_file_sha256_no_progress(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0u8; HASH_IO_BUFFER_SIZE];
+
+    loop {
+        if crate::signal_handler::is_interrupted() {
+            return Err(DownloaderError::Other(
+                "Download interrupted by user".to_string(),
+            ));
+        }
+        if crate::signal_handler::interrupt_requested()
+            && crate::signal_handler::confirm_pending_interrupt()
+        {
+            return Err(DownloaderError::Other(
+                "Download interrupted by user".to_string(),
+            ));
+        }
+
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
 
     Ok(hex::encode(hasher.finalize()))
 }
@@ -1270,6 +1912,37 @@ fn cleanup_chunk_workspace(workspace: &ChunkedWorkspace) {
     }
 }
 
+/// Clean up corrupted partial download files when digest verification fails.
+/// Removes the `.parts/<digest>.bin` and `.parts/<digest>.state.json` files
+/// so the next retry can start fresh.
+fn cleanup_corrupted_partial_files(blobs_dir: &Path, named_digest: &str) {
+    let parts_root = blobs_dir.join(".parts");
+    if !parts_root.exists() {
+        return;
+    }
+
+    let stem = digest_fs_name(named_digest);
+    let data_file = parts_root.join(format!("{}.bin", stem));
+    let state_file = parts_root.join(format!("{}.state.json", stem));
+
+    if let Err(e) = fs::remove_file(&data_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove corrupted partial blob file {:?}: {}",
+            data_file, e
+        );
+    }
+    if let Err(e) = fs::remove_file(&state_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove partial state file {:?}: {}",
+            state_file, e
+        );
+    }
+}
+
 // ─── Blob / manifest persistence ─────────────────────────────────────────────
 
 pub fn save_blob(
@@ -1287,6 +1960,27 @@ pub fn save_blob(
             "Digest mismatch: expected {}, got {}",
             expected_digest, computed_digest
         );
+
+        // Clean up corrupted partial files so next retry starts fresh
+        let models_path = match expand_models_path(models_path) {
+            Ok(path) => path,
+            Err(_) => {
+                // If we can't expand path, we still need to fail, but we can't clean up
+                return Err(DownloaderError::Other(format!(
+                    "Digest mismatch for {}",
+                    named_digest
+                )));
+            }
+        };
+        let blobs_dir = models_path.join("blobs");
+        if blobs_dir.exists() {
+            cleanup_corrupted_partial_files(&blobs_dir, named_digest);
+            info!(
+                "Cleaned up corrupted partial files for {}; next retry will start fresh",
+                named_digest
+            );
+        }
+
         return Err(DownloaderError::Other(format!(
             "Digest mismatch for {}",
             named_digest
@@ -1320,9 +2014,9 @@ pub fn save_blob(
         ensure_ownership(&blobs_dir, ownership);
     }
 
-    // Remove source from unnecessary files and add target
+    // Remove source from temporary cleanup tracking. The committed target must
+    // survive failures for resumable downloads.
     unnecessary_files.remove(&source.to_path_buf());
-    unnecessary_files.insert(target_file.clone());
 
     info!("Moved {:?} to {:?}", source, target_file);
 
@@ -1358,8 +2052,6 @@ pub fn save_manifest(
         }
     }
     info!("Saved manifest to {:?}", target_file);
-
-    unnecessary_files.insert(target_file.clone());
 
     Ok(target_file)
 }
@@ -1430,15 +2122,500 @@ fn ensure_ownership_for_dir_tree(models_root: &Path, dir: &Path, ownership: Owne
 fn apply_ownership(path: &Path, ownership: Ownership) {
     #[cfg(unix)]
     {
-        let spec = format!("{}:{}", ownership.uid, ownership.gid);
-        match Command::new("chown").arg(&spec).arg(path).status() {
-            Ok(status) if status.success() => {}
-            Ok(status) => warn!("Failed to chown {:?}: exit status {}", path, status),
-            Err(e) => warn!("Failed to chown {:?}: {}", path, e),
+        let path_bytes = path.as_os_str().as_bytes();
+        match CString::new(path_bytes) {
+            Ok(path_cstr) => {
+                let rc = unsafe {
+                    libc::chown(
+                        path_cstr.as_ptr(),
+                        ownership.uid as libc::uid_t,
+                        ownership.gid as libc::gid_t,
+                    )
+                };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    warn!("Failed to chown {:?}: {}", path, err);
+                }
+            }
+            Err(e) => warn!("Failed to chown {:?}: invalid path bytes ({})", path, e),
         }
     }
     #[cfg(not(unix))]
     {
         let _ = (path, ownership);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::blocking::Client;
+    use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Mutex, OnceLock};
+    use std::{env, fs};
+    use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn interrupt_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_blob(path: &Path, bytes: &[u8]) {
+        let mut file = fs::File::create(path).expect("create file");
+        file.write_all(bytes).expect("write file");
+    }
+
+    fn reset_interrupt_flag_for_test() {
+        crate::signal_handler::INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn unique_test_temp_path(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        env::temp_dir().join(format!("{}-{}-{}.bin", prefix, pid, seq))
+    }
+
+    fn make_test_worker(
+        queue: Arc<Mutex<VecDeque<u64>>>,
+        parts_done: Arc<AtomicU64>,
+        cancel: Arc<AtomicBool>,
+        done_tx: mpsc::Sender<ChunkCoordinatorEvent>,
+    ) -> ChunkWorker<'static> {
+        ChunkWorker {
+            client: Client::new(),
+            url: "http://localhost",
+            named_digest: "sha256:test",
+            data_file: unique_test_temp_path("odir-test-part"),
+            queue,
+            bytes_done: Arc::new(AtomicU64::new(0)),
+            parts_done,
+            cancel,
+            first_error: Arc::new(Mutex::new(None)),
+            done_tx,
+            num_parts: 1,
+            chunk_size: 1,
+            total_size: 1,
+        }
+    }
+
+    #[test]
+    fn test_chunk_worker_requeues_aborted_part_when_continuing() {
+        let _guard = interrupt_lock().lock().expect("lock");
+        reset_interrupt_flag_for_test();
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let parts_done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel::<ChunkCoordinatorEvent>();
+        let worker = make_test_worker(
+            Arc::clone(&queue),
+            Arc::clone(&parts_done),
+            Arc::clone(&cancel),
+            done_tx,
+        );
+
+        let should_continue = worker.handle_part_outcome(7, ChunkPartOutcome::Aborted);
+
+        assert!(should_continue);
+        assert_eq!(parts_done.load(Ordering::Acquire), 0);
+        assert_eq!(
+            queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front(),
+            Some(7)
+        );
+        assert!(done_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_chunk_worker_completed_part_signals_done() {
+        let _guard = interrupt_lock().lock().expect("lock");
+        reset_interrupt_flag_for_test();
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let parts_done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel::<ChunkCoordinatorEvent>();
+        let worker = make_test_worker(
+            Arc::clone(&queue),
+            Arc::clone(&parts_done),
+            Arc::clone(&cancel),
+            done_tx,
+        );
+
+        let should_continue = worker.handle_part_outcome(3, ChunkPartOutcome::Completed);
+
+        assert!(should_continue);
+        assert_eq!(parts_done.load(Ordering::Acquire), 1);
+        match done_rx.try_recv() {
+            Ok(ChunkCoordinatorEvent::PartDone(idx)) => assert_eq!(idx, 3),
+            other => panic!("unexpected event: {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn test_verified_blob_is_detected() {
+        let _guard = interrupt_lock().lock().expect("lock");
+        reset_interrupt_flag_for_test();
+        let td = tempdir().expect("tempdir");
+        let models_root = td.path().join("models");
+        let blobs_dir = models_root.join("blobs");
+        fs::create_dir_all(&blobs_dir).expect("create dirs");
+
+        let payload = b"hello world";
+        let digest = hex::encode(Sha256::digest(payload));
+        let named_digest = format!("sha256:{}", digest);
+        let blob_path = blobs_dir.join(named_digest.replace(':', "-"));
+        write_blob(&blob_path, payload);
+
+        let blob_path =
+            blob_path_from_digest(models_root.to_string_lossy().as_ref(), &named_digest)
+                .expect("blob path");
+        let verified = verify_blob_file_digest(&blob_path, &named_digest).expect("verify blob");
+        assert!(verified);
+    }
+
+    #[test]
+    fn test_invalid_blob_is_removed() {
+        let _guard = interrupt_lock().lock().expect("lock");
+        reset_interrupt_flag_for_test();
+        let td = tempdir().expect("tempdir");
+        let models_root = td.path().join("models");
+        let blobs_dir = models_root.join("blobs");
+        fs::create_dir_all(&blobs_dir).expect("create dirs");
+
+        let payload = b"actual-bytes";
+        let wrong_digest = format!("sha256:{}", "0".repeat(64));
+        let blob_path = blobs_dir.join(wrong_digest.replace(':', "-"));
+        write_blob(&blob_path, payload);
+
+        assert!(blob_path.exists());
+        remove_blob_if_invalid(models_root.to_string_lossy().as_ref(), &wrong_digest)
+            .expect("remove invalid");
+        assert!(!blob_path.exists());
+    }
+
+    #[test]
+    fn test_journal_roundtrip_and_corrupt_recovery() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let model = "llama3.2:8b";
+        let (path, mut journal) = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "8b",
+            vec![DownloadJournalItem {
+                digest: "sha256:abc".to_string(),
+                media_type: "application/test".to_string(),
+                size: 123,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+            td.path().join("models").to_string_lossy().as_ref(),
+        )
+        .expect("init journal");
+
+        update_journal_item_state(
+            &mut journal,
+            "sha256:abc",
+            JournalItemState::Completed,
+            None,
+        );
+        write_journal_atomic(&path, &journal).expect("write journal");
+
+        let loaded = load_journal_or_recover(&path).expect("load ok");
+        assert!(loaded.is_some());
+        assert!(matches!(
+            loaded.expect("present").items[0].state,
+            JournalItemState::Completed
+        ));
+
+        fs::write(&path, "{not-json").expect("write corrupt journal");
+        let recovered = load_journal_or_recover(&path).expect("recover corrupt");
+        assert!(recovered.is_none());
+    }
+
+    #[test]
+    fn test_write_journal_atomic_overwrites_existing_file() {
+        let td = tempdir().expect("tempdir");
+        let journal_path = td.path().join("journal.json");
+
+        let first = DownloadJournal {
+            model_identifier: "model-a:q4".to_string(),
+            source_type: DownloadSourceType::Ollama,
+            tag_or_quant: "q4".to_string(),
+            started_at: 1,
+            updated_at: 2,
+            items: vec![DownloadJournalItem {
+                digest: "sha256:abc".to_string(),
+                media_type: "application/test".to_string(),
+                size: 10,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+        };
+        write_journal_atomic(&journal_path, &first).expect("write first journal");
+
+        let second = DownloadJournal {
+            model_identifier: "model-b:q8".to_string(),
+            source_type: DownloadSourceType::Hf,
+            tag_or_quant: "q8".to_string(),
+            started_at: 11,
+            updated_at: 12,
+            items: vec![DownloadJournalItem {
+                digest: "sha256:def".to_string(),
+                media_type: "application/test".to_string(),
+                size: 20,
+                state: JournalItemState::Completed,
+                last_error: None,
+            }],
+        };
+        write_journal_atomic(&journal_path, &second).expect("overwrite journal");
+
+        let loaded = load_journal_or_recover(&journal_path)
+            .expect("load overwritten journal")
+            .expect("journal should exist");
+
+        assert_eq!(loaded.model_identifier, "model-b:q8");
+        assert!(matches!(loaded.source_type, DownloadSourceType::Hf));
+        assert_eq!(loaded.items.len(), 1);
+        assert!(matches!(loaded.items[0].state, JournalItemState::Completed));
+    }
+
+    #[test]
+    fn test_journal_reconcile_marks_present_unverified_for_invalid_existing_blob() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let models_root = td.path().join("models");
+        let blobs_dir = models_root.join("blobs");
+        fs::create_dir_all(&blobs_dir).expect("create blobs dir");
+
+        let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let blob_path = blobs_dir.join(digest.replace(':', "-"));
+        fs::write(&blob_path, b"corrupt-bytes").expect("write invalid blob");
+
+        let model = "invalid-existing-blob:latest";
+        let (journal_path, _first_journal) = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "latest",
+            vec![DownloadJournalItem {
+                digest: digest.to_string(),
+                media_type: "application/test".to_string(),
+                size: 10,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("init journal with invalid blob present");
+
+        let mut existing = load_journal_or_recover(&journal_path)
+            .expect("load journal")
+            .expect("journal should exist");
+        update_journal_item_state(
+            &mut existing,
+            digest,
+            JournalItemState::Failed,
+            Some("network timeout".to_string()),
+        );
+        write_journal_atomic(&journal_path, &existing).expect("persist failed state");
+
+        let (_, reconciled) = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "latest",
+            vec![DownloadJournalItem {
+                digest: digest.to_string(),
+                media_type: "application/test".to_string(),
+                size: 10,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("reconcile should mark invalid existing blob as present_unverified");
+
+        assert!(matches!(
+            reconciled.items[0].state,
+            JournalItemState::PresentUnverified
+        ));
+        assert_eq!(
+            reconciled.items[0].last_error.as_deref(),
+            Some("network timeout")
+        );
+    }
+
+    #[test]
+    fn test_cleanup_ttl_removes_stale_transients() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let models_root = td.path().join("models");
+        let parts_dir = models_root.join("blobs").join(".parts");
+        fs::create_dir_all(&parts_dir).expect("create parts");
+        let transient_file = parts_dir.join("orphan.bin");
+        fs::write(&transient_file, b"x").expect("write transient");
+
+        let settings = AppSettings {
+            ollama_library: crate::config::OllamaLibrary {
+                models_path: models_root.to_string_lossy().to_string(),
+                transient_cleanup_enabled: true,
+                transient_ttl_hours: 0,
+                failed_journal_ttl_hours: 0,
+                completed_journal_ttl_hours: 0,
+                ..crate::config::OllamaLibrary::default()
+            },
+            ..AppSettings::default()
+        };
+
+        std::thread::sleep(Duration::from_secs(1));
+        let summary = cleanup_stale_transient_artefacts(&settings).expect("cleanup");
+        assert!(summary.removed_transient_files >= 1);
+        assert!(!transient_file.exists());
+    }
+
+    #[test]
+    fn test_clear_journal_incomplete_removes_partial_files() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let model = "gemma3:270m";
+        let digest = "sha256:deadbeef";
+        let models_root = td.path().join("models");
+        let parts_root = models_root.join("blobs").join(".parts");
+        fs::create_dir_all(&parts_root).expect("create parts dir");
+
+        let stem = digest.replace(':', "-");
+        let part_bin = parts_root.join(format!("{}.bin", stem));
+        let part_state = parts_root.join(format!("{}.state.json", stem));
+        fs::write(&part_bin, b"partial").expect("write part bin");
+        fs::write(&part_state, b"{}").expect("write state");
+
+        let _ = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "270m",
+            vec![DownloadJournalItem {
+                digest: digest.to_string(),
+                media_type: "application/test".to_string(),
+                size: 123,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("init journal");
+
+        let summary = clear_journal_for_model(
+            model,
+            DownloadSourceType::Ollama,
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("clear journal");
+
+        assert!(summary.removed_journal);
+        assert!(!summary.had_completed_download);
+        assert!(summary.removed_partial_files >= 2);
+        assert!(!part_bin.exists());
+        assert!(!part_state.exists());
+    }
+
+    #[test]
+    fn test_clear_journal_completed_keeps_blob_data() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let model = "all-minilm:22m";
+        let payload = b"verified-content";
+        let digest_hex = hex::encode(Sha256::digest(payload));
+        let digest = format!("sha256:{}", digest_hex);
+        let models_root = td.path().join("models");
+        let blobs_dir = models_root.join("blobs");
+        fs::create_dir_all(&blobs_dir).expect("create blobs dir");
+        let blob_path = blobs_dir.join(digest.replace(':', "-"));
+        fs::write(&blob_path, payload).expect("write blob");
+
+        let _ = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "22m",
+            vec![DownloadJournalItem {
+                digest: digest.clone(),
+                media_type: "application/test".to_string(),
+                size: payload.len() as u64,
+                state: JournalItemState::Pending,
+                last_error: None,
+            }],
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("init journal");
+
+        let summary = clear_journal_for_model(
+            model,
+            DownloadSourceType::Ollama,
+            models_root.to_string_lossy().as_ref(),
+        )
+        .expect("clear journal");
+
+        assert!(summary.removed_journal);
+        assert!(summary.had_completed_download);
+        assert_eq!(summary.removed_partial_files, 0);
+        assert!(blob_path.exists());
+    }
+
+    #[test]
+    fn test_remove_stale_journals_skips_recovered_corrupt_entries() {
+        let td = tempdir().expect("tempdir");
+        let journal_dir = td.path().join("journals");
+        fs::create_dir_all(&journal_dir).expect("create journal dir");
+
+        let bad_path = journal_dir.join("bad.json");
+        fs::write(&bad_path, b"{not-json").expect("write corrupt json");
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let result = remove_stale_journals(
+            &journal_dir,
+            SystemTime::now(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+
+        assert!(result.is_ok());
+        assert!(!bad_path.exists());
+        let renamed_exists = fs::read_dir(&journal_dir)
+            .expect("read journal dir")
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("bad.corrupt."))
+                    .unwrap_or(false)
+            });
+        assert!(renamed_exists);
     }
 }

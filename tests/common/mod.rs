@@ -1,4 +1,5 @@
 //! Common test utilities for integration tests
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -90,11 +91,17 @@ pub fn send_sigint(child: &mut Child) {
 /// Panics if unable to send the signal
 #[cfg(unix)]
 pub fn send_sigterm(child: &mut Child) {
+    use nix::errno::Errno;
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
 
     let pid = Pid::from_raw(child.id() as i32);
-    signal::kill(pid, Signal::SIGTERM).expect("Failed to send SIGTERM");
+    match signal::kill(pid, Signal::SIGTERM) {
+        Ok(()) => {}
+        // Process already exited — nothing to do.
+        Err(Errno::ESRCH) => {}
+        Err(e) => panic!("Failed to send SIGTERM: {e}"),
+    }
 }
 
 /// Send SIGTERM equivalent on Windows
