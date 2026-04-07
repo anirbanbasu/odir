@@ -59,21 +59,21 @@ Let's explore the configuration in details. The default content is as follows.
         "url": "http://localhost:11434",
         "api_key": null,
         "remove_downloaded_on_error": true,
-      "check_model_presence": true,
-      "keep_verified_blobs_on_error": true
+        "check_model_presence": true,
+        "keep_verified_blobs_on_error": true
     },
     "ollama_library": {
-        "models_path": "~/.ollama/models",
+        "models_path": "/home/username/.ollama/models",
         "registry_base_url": "https://registry.ollama.ai/v2/library/",
         "library_base_url": "https://ollama.com/library",
         "verify_ssl": true,
         "timeout": 120.0,
         "chunk_size_mib": 128,
-      "download_chunks_in_parallel": true,
-      "transient_cleanup_enabled": true,
-      "transient_ttl_hours": 72,
-      "failed_journal_ttl_hours": 168,
-      "completed_journal_ttl_hours": 24
+        "download_chunks_in_parallel": true,
+        "transient_cleanup_enabled": true,
+        "transient_ttl_hours": 72,
+        "failed_journal_ttl_hours": 168,
+        "completed_journal_ttl_hours": 24
     }
 }
 ```

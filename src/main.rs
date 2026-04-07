@@ -142,7 +142,7 @@ enum Commands {
         source: Option<JournalSourceArg>,
 
         /// Delete the journal for one specific model (with confirmation).
-        #[arg(long, conflicts_with = "list", conflicts_with = "json")]
+        #[arg(long, conflicts_with_all = ["list", "json"])]
         clear: bool,
 
         /// Print machine-readable JSON output.

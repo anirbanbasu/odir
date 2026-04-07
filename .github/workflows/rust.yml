@@ -39,8 +39,9 @@ jobs:
               run: cargo clippy -- -D warnings
             - name: Build
               run: cargo build --verbose
-            - name: Setup Ollama
-              # Ollama is required for model download tests, which are set to be ignored by default
-              uses: ai-action/setup-ollama@8dace3eab22ce4d761427bb75f8f70f1270ea660 # v2.0.25
+            # Setting up Ollama is not required since the minimal tests do not require it.
+            # - name: Setup Ollama
+            #   # Ollama is required for model download tests, which are set to be ignored by default
+            #   uses: ai-action/setup-ollama@8dace3eab22ce4d761427bb75f8f70f1270ea660 # v2.0.25
             - name: Run minimal tests
               run: cargo test -- --test-threads=1
