@@ -162,8 +162,9 @@ fn test_hf_large_model_download_single_stream() {
 /// Lightweight non-interactive check for download mode indicator in output.
 ///
 /// This test starts the larger HF model download, lets it run briefly,
-/// terminates the process, and asserts that output indicates single-stream
-/// fallback behavior.
+/// terminates the process, and asserts that output indicates either:
+/// - single-stream fallback behavior for active network downloads, or
+/// - resume/verification behavior when blobs are already cached.
 #[test]
 #[ignore]
 fn test_hf_large_model_mode_indicator_non_interactive() {
@@ -207,8 +208,10 @@ fn test_hf_large_model_mode_indicator_non_interactive() {
 
     assert!(
         combined.contains("falling back to single-stream download")
-            || combined.contains("Server does not support byte-range probe"),
-        "Expected single-stream fallback indicator in output, but none was found"
+            || combined.contains("Server does not support byte-range probe")
+            || combined.contains("Verifying existing item")
+            || combined.contains("already present and verified"),
+        "Expected fallback or resume verification indicator in output, but none was found"
     );
 }
 

@@ -21,11 +21,27 @@ use {
 /// Flag that indicates if the application has been interrupted
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PROGRESS_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static PENDING_SIGNAL: AtomicUsize = AtomicUsize::new(0);
 static CONFIRMATION_REQUIRED: AtomicBool = AtomicBool::new(false);
 static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 static KEEP_PARTIAL_DOWNLOADS: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct PromptGuard;
+
+impl PromptGuard {
+    fn begin() -> Self {
+        INTERRUPT_PROMPT_ACTIVE.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for PromptGuard {
+    fn drop(&mut self) {
+        INTERRUPT_PROMPT_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 enum InterruptDecision {
     ExitAndRemove,
@@ -90,7 +106,17 @@ pub fn set_confirmation_required(required: bool) {
 
 /// Mark whether a progress bar is currently active
 pub fn set_progress_active(active: bool) {
-    PROGRESS_ACTIVE.store(active, Ordering::Release);
+    if active {
+        PROGRESS_ACTIVE_DEPTH.fetch_add(1, Ordering::AcqRel);
+    } else {
+        let _ = PROGRESS_ACTIVE_DEPTH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            Some(v.saturating_sub(1))
+        });
+    }
+}
+
+fn progress_active() -> bool {
+    PROGRESS_ACTIVE_DEPTH.load(Ordering::Acquire) > 0
 }
 
 /// Signal that cleanup operations have completed
@@ -103,6 +129,11 @@ pub fn interrupt_requested() -> bool {
     INTERRUPT_REQUESTED.load(Ordering::Acquire)
 }
 
+/// Returns true while an interrupt confirmation prompt is currently active.
+pub fn interrupt_prompt_active() -> bool {
+    INTERRUPT_PROMPT_ACTIVE.load(Ordering::Acquire)
+}
+
 /// Prompt the user to confirm interrupt for a pending signal
 /// Returns true if the user confirms the interrupt
 pub fn confirm_pending_interrupt() -> bool {
@@ -110,6 +141,7 @@ pub fn confirm_pending_interrupt() -> bool {
         return false;
     };
 
+    let _guard = PromptGuard::begin();
     KEEP_PARTIAL_DOWNLOADS.store(false, Ordering::Release);
     if prompt_for_interrupt_confirmation(label) {
         set_interrupted();
@@ -129,6 +161,7 @@ pub fn confirm_pending_interrupt_for_chunked(completed_parts: u64) -> bool {
         return false;
     };
 
+    let _guard = PromptGuard::begin();
     apply_chunked_interrupt_decision(prompt_for_interrupt_confirmation_chunked(
         label,
         completed_parts,
@@ -139,7 +172,7 @@ pub fn confirm_pending_interrupt_for_chunked(completed_parts: u64) -> bool {
 /// Returns true if user confirms (Yes/Y), false if user cancels (No/N)
 fn prompt_for_interrupt_confirmation(signal_name: &str) -> bool {
     eprint!(
-        "\n{}: All partially downloaded temporary files will be removed. Do you really want to exit? [y/N] (timeout to N in 10 seconds): ",
+        "\n{}: Already downloaded files will be left behind so that the download can be resumed later. Do you really want to exit? [y/N] (timeout to N in 10 seconds): ",
         signal_name
     );
     let _ = io::stderr().flush();
@@ -312,7 +345,7 @@ fn prompt_for_interrupt_confirmation_chunked(
     completed_parts: u64,
 ) -> InterruptDecision {
     eprint!(
-        "\n{}: All partially downloaded temporary files can be removed. Do you really want to exit? Enter k to keep {} partial downloads. [y/k/N] (timeout to N in 10 seconds): ",
+        "\n{}: Already downloaded files will be left behind so that the download can be resumed later. Do you really want to exit? Enter k to also keep {} completed partial downloaded chunks of the current download for better resumability. [y/k/N] (timeout to N in 10 seconds): ",
         signal_name, completed_parts
     );
     let _ = io::stderr().flush();
@@ -387,7 +420,7 @@ pub fn install_signal_handlers() {
                         std::process::exit(130); // Standard exit code for SIGINT
                     }
 
-                    if PROGRESS_ACTIVE.load(Ordering::Acquire) {
+                    if progress_active() {
                         PENDING_SIGNAL.store(SIGINT as usize, Ordering::Release);
                         INTERRUPT_REQUESTED.store(true, Ordering::Release);
                         continue;
@@ -409,7 +442,7 @@ pub fn install_signal_handlers() {
                         std::process::exit(143); // Standard exit code for SIGTERM
                     }
 
-                    if PROGRESS_ACTIVE.load(Ordering::Acquire) {
+                    if progress_active() {
                         PENDING_SIGNAL.store(SIGTERM as usize, Ordering::Release);
                         INTERRUPT_REQUESTED.store(true, Ordering::Release);
                         continue;
@@ -444,7 +477,7 @@ mod tests {
     fn reset_flags() {
         INTERRUPTED.store(false, Ordering::SeqCst);
         INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
-        PROGRESS_ACTIVE.store(false, Ordering::SeqCst);
+        PROGRESS_ACTIVE_DEPTH.store(0, Ordering::SeqCst);
         PENDING_SIGNAL.store(0, Ordering::SeqCst);
         CONFIRMATION_REQUIRED.store(false, Ordering::SeqCst);
         CLEANUP_DONE.store(false, Ordering::SeqCst);
@@ -602,13 +635,33 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chunked_interrupt_decision_empty_defaults_to_continue() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+        assert!(matches!(
+            parse_chunked_interrupt_decision(""),
+            InterruptDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn test_parse_chunked_interrupt_decision_k_means_exit_and_keep() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_flags();
+        assert!(matches!(
+            parse_chunked_interrupt_decision("k"),
+            InterruptDecision::ExitAndKeep
+        ));
+    }
+
+    #[test]
     fn test_set_progress_active() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_flags();
         set_progress_active(true);
-        assert!(PROGRESS_ACTIVE.load(Ordering::Acquire));
+        assert!(progress_active());
         set_progress_active(false);
-        assert!(!PROGRESS_ACTIVE.load(Ordering::Acquire));
+        assert!(!progress_active());
     }
 
     #[test]
@@ -631,7 +684,7 @@ mod tests {
         PENDING_SIGNAL.store(SIGINT as usize, Ordering::Release);
         INTERRUPT_REQUESTED.store(true, Ordering::Release);
 
-        assert!(PROGRESS_ACTIVE.load(Ordering::Acquire));
+        assert!(progress_active());
         assert!(INTERRUPT_REQUESTED.load(Ordering::Acquire));
         assert_eq!(PENDING_SIGNAL.load(Ordering::Acquire), SIGINT as usize);
     }
@@ -646,7 +699,7 @@ mod tests {
         PENDING_SIGNAL.store(SIGTERM as usize, Ordering::Release);
         INTERRUPT_REQUESTED.store(true, Ordering::Release);
 
-        assert!(PROGRESS_ACTIVE.load(Ordering::Acquire));
+        assert!(progress_active());
         assert!(INTERRUPT_REQUESTED.load(Ordering::Acquire));
         assert_eq!(PENDING_SIGNAL.load(Ordering::Acquire), SIGTERM as usize);
     }
@@ -680,7 +733,7 @@ mod tests {
 
         let interrupted = INTERRUPTED.load(Ordering::Acquire);
         let conf_required = CONFIRMATION_REQUIRED.load(Ordering::Acquire);
-        let progress = PROGRESS_ACTIVE.load(Ordering::Acquire);
+        let progress = progress_active();
         let pending = PENDING_SIGNAL.load(Ordering::Acquire);
 
         assert!(interrupted || !interrupted);
@@ -740,7 +793,7 @@ mod tests {
         assert!(CONFIRMATION_REQUIRED.load(Ordering::Acquire));
 
         set_progress_active(true);
-        assert!(PROGRESS_ACTIVE.load(Ordering::Acquire));
+        assert!(progress_active());
 
         INTERRUPT_REQUESTED.store(true, Ordering::Release);
         assert!(INTERRUPT_REQUESTED.load(Ordering::Acquire));
@@ -756,7 +809,7 @@ mod tests {
         assert!(!is_interrupted());
         assert!(!interrupt_requested());
         assert!(!CONFIRMATION_REQUIRED.load(Ordering::Acquire));
-        assert!(!PROGRESS_ACTIVE.load(Ordering::Acquire));
+        assert!(!progress_active());
         assert_eq!(PENDING_SIGNAL.load(Ordering::Acquire), 0);
     }
 }
