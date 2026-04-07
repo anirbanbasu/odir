@@ -1,5 +1,5 @@
 //! Configuration management for the Ollama Downloader in Rust (ODIR).
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use log::{LevelFilter, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -112,7 +112,7 @@ pub struct OllamaLibrary {
 impl Default for OllamaLibrary {
     fn default() -> Self {
         Self {
-            models_path: "~/.ollama/models".to_string(),
+            models_path: default_models_path(),
             registry_base_url: "https://registry.ollama.ai/v2/library/".to_string(),
             library_base_url: "https://ollama.com/library/".to_string(),
             verify_ssl: true,
@@ -125,6 +125,18 @@ impl Default for OllamaLibrary {
             completed_journal_ttl_hours: 24,
         }
     }
+}
+
+fn default_models_path() -> String {
+    BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".ollama").join("models"))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            PathBuf::from(".ollama")
+                .join("models")
+                .to_string_lossy()
+                .into_owned()
+        })
 }
 
 /// Application settings for the Ollama Downloader.
@@ -712,7 +724,7 @@ mod tests {
     #[test]
     fn test_default_ollama_library() {
         let library = OllamaLibrary::default();
-        assert_eq!(library.models_path, "~/.ollama/models");
+        assert_eq!(library.models_path, default_models_path());
         assert_eq!(
             library.registry_base_url,
             "https://registry.ollama.ai/v2/library/"
@@ -842,7 +854,7 @@ mod tests {
         // Check that provided values are preserved
         assert_eq!(settings.ollama_server.url, "http://localhost:11434/");
         assert_eq!(settings.ollama_server.remove_downloaded_on_error, true);
-        assert_eq!(settings.ollama_library.models_path, "~/.ollama/models");
+        assert_eq!(settings.ollama_library.models_path, default_models_path());
 
         // Check that missing values use defaults
         assert_eq!(settings.ollama_server.api_key, None);

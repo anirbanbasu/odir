@@ -607,21 +607,29 @@ fn remove_stale_journals(
             continue;
         };
 
-        let journal = load_journal_or_recover(&path)?;
+        let Some(journal) = load_journal_or_recover(&path)? else {
+            // load_journal_or_recover may rename malformed JSON away and return None.
+            // Skip TTL deletion for this entry because the original path may no longer exist.
+            continue;
+        };
         let is_completed = journal
-            .as_ref()
-            .map(|j| {
-                j.items
-                    .iter()
-                    .all(|i| matches!(i.state, JournalItemState::Completed))
-            })
-            .unwrap_or(false);
+            .items
+            .iter()
+            .all(|i| matches!(i.state, JournalItemState::Completed));
 
         if is_completed && age > completed_ttl {
-            fs::remove_file(&path)?;
+            if let Err(e) = fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(DownloaderError::IoError(e));
+            }
             removed_completed += 1;
         } else if !is_completed && age > failed_ttl {
-            fs::remove_file(&path)?;
+            if let Err(e) = fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(DownloaderError::IoError(e));
+            }
             removed_failed += 1;
         }
     }
@@ -2142,6 +2150,7 @@ mod tests {
     use super::*;
     use reqwest::blocking::Client;
     use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Mutex, OnceLock};
     use std::{env, fs};
     use tempfile::tempdir;
@@ -2165,6 +2174,13 @@ mod tests {
         crate::signal_handler::INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn unique_test_temp_path(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        env::temp_dir().join(format!("{}-{}-{}.bin", prefix, pid, seq))
+    }
+
     fn make_test_worker(
         queue: Arc<Mutex<VecDeque<u64>>>,
         parts_done: Arc<AtomicU64>,
@@ -2175,7 +2191,7 @@ mod tests {
             client: Client::new(),
             url: "http://localhost",
             named_digest: "sha256:test",
-            data_file: PathBuf::from("/tmp/odir-test-part.bin"),
+            data_file: unique_test_temp_path("odir-test-part"),
             queue,
             bytes_done: Arc::new(AtomicU64::new(0)),
             parts_done,
@@ -2567,5 +2583,38 @@ mod tests {
         assert!(summary.had_completed_download);
         assert_eq!(summary.removed_partial_files, 0);
         assert!(blob_path.exists());
+    }
+
+    #[test]
+    fn test_remove_stale_journals_skips_recovered_corrupt_entries() {
+        let td = tempdir().expect("tempdir");
+        let journal_dir = td.path().join("journals");
+        fs::create_dir_all(&journal_dir).expect("create journal dir");
+
+        let bad_path = journal_dir.join("bad.json");
+        fs::write(&bad_path, b"{not-json").expect("write corrupt json");
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let result = remove_stale_journals(
+            &journal_dir,
+            SystemTime::now(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+
+        assert!(result.is_ok());
+        assert!(!bad_path.exists());
+        let renamed_exists = fs::read_dir(&journal_dir)
+            .expect("read journal dir")
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("bad.corrupt."))
+                    .unwrap_or(false)
+            });
+        assert!(renamed_exists);
     }
 }

@@ -16,9 +16,7 @@ use config::{AppSettings, Config};
 mod downloader;
 use downloader::manifest::{DownloadJournal, DownloadJournalListEntry, DownloadSourceType};
 use downloader::utils::{clear_journal_for_model, list_available_journals, load_journal_for_model};
-use downloader::{
-    DownloaderError, HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader,
-};
+use downloader::{HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader};
 
 mod signal_handler;
 
@@ -579,9 +577,7 @@ fn handle_model_download(model_tag: String) {
                     signal_handler::set_cleanup_done();
                 }
                 Err(e) => {
-                    if should_log_download_error_in_main(&e) {
-                        error!("Error downloading model '{}': {}", model_tag, e);
-                    }
+                    error!("Error downloading model '{}': {}", model_tag, e);
                     if !signal_handler::is_interrupted() {
                         std::process::exit(1);
                     }
@@ -668,12 +664,10 @@ fn handle_hf_model_download(user_repo_quant: String) {
                     signal_handler::set_cleanup_done();
                 }
                 Err(e) => {
-                    if should_log_download_error_in_main(&e) {
-                        error!(
-                            "Error downloading HuggingFace model '{}': {}",
-                            user_repo_quant, e
-                        );
-                    }
+                    error!(
+                        "Error downloading HuggingFace model '{}': {}",
+                        user_repo_quant, e
+                    );
                     if !signal_handler::is_interrupted() {
                         std::process::exit(1);
                     }
@@ -690,13 +684,6 @@ fn handle_hf_model_download(user_repo_quant: String) {
             std::process::exit(1);
         }
     }
-}
-
-fn should_log_download_error_in_main(error: &DownloaderError) -> bool {
-    !matches!(
-        error,
-        DownloaderError::HttpError(_) | DownloaderError::HttpStatus(_)
-    )
 }
 
 fn handle_od_copy_settings(od_settings_file: String) {
