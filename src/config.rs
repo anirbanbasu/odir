@@ -1,8 +1,8 @@
 //! Configuration management for the Ollama Downloader in Rust (ODIR).
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use log::{LevelFilter, info, warn};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
 use std::io;
@@ -49,6 +49,10 @@ pub struct OllamaServer {
 
     /// Whether to check if the model is present in the Ollama server after downloading.
     pub check_model_presence: bool,
+
+    /// Whether verified blobs should be kept on error.
+    /// If false, strict all-or-nothing rollback is used.
+    pub keep_verified_blobs_on_error: bool,
 }
 
 impl Default for OllamaServer {
@@ -58,6 +62,7 @@ impl Default for OllamaServer {
             api_key: None,
             remove_downloaded_on_error: true,
             check_model_presence: true,
+            keep_verified_blobs_on_error: true,
         }
     }
 }
@@ -90,20 +95,48 @@ pub struct OllamaLibrary {
     /// If false, chunked downloads run serially with one worker.
     /// Default is true.
     pub download_chunks_in_parallel: bool,
+
+    /// Enable cleanup of stale transient artefacts.
+    pub transient_cleanup_enabled: bool,
+
+    /// Time-to-live in hours for stale transient artefacts.
+    pub transient_ttl_hours: u64,
+
+    /// Time-to-live in hours for failed journal files.
+    pub failed_journal_ttl_hours: u64,
+
+    /// Time-to-live in hours for completed journal files.
+    pub completed_journal_ttl_hours: u64,
 }
 
 impl Default for OllamaLibrary {
     fn default() -> Self {
         Self {
-            models_path: "~/.ollama/models".to_string(),
+            models_path: default_models_path(),
             registry_base_url: "https://registry.ollama.ai/v2/library/".to_string(),
             library_base_url: "https://ollama.com/library/".to_string(),
             verify_ssl: true,
             timeout: 120.0,
             chunk_size_mib: 128,
             download_chunks_in_parallel: true,
+            transient_cleanup_enabled: true,
+            transient_ttl_hours: 72,
+            failed_journal_ttl_hours: 168,
+            completed_journal_ttl_hours: 24,
         }
     }
+}
+
+fn default_models_path() -> String {
+    BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".ollama").join("models"))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            PathBuf::from(".ollama")
+                .join("models")
+                .to_string_lossy()
+                .into_owned()
+        })
 }
 
 /// Application settings for the Ollama Downloader.
@@ -117,6 +150,146 @@ pub struct AppSettings {
 }
 
 impl AppSettings {
+    fn insert_default_if_missing(
+        target: &mut Map<String, Value>,
+        section: &str,
+        key: &str,
+        default_desc: String,
+        default_value: Value,
+    ) {
+        if !target.contains_key(key) {
+            warn!(
+                "Missing field '{}.{}', using default: {}",
+                section, key, default_desc
+            );
+            target.insert(key.to_string(), default_value);
+        }
+    }
+
+    fn fill_missing_ollama_server_defaults(ollama_server: &mut Map<String, Value>) {
+        let defaults = OllamaServer::default();
+
+        Self::insert_default_if_missing(
+            ollama_server,
+            "ollama_server",
+            "url",
+            defaults.url.clone(),
+            Value::String(defaults.url),
+        );
+        Self::insert_default_if_missing(
+            ollama_server,
+            "ollama_server",
+            "api_key",
+            "None".to_string(),
+            Value::Null,
+        );
+        Self::insert_default_if_missing(
+            ollama_server,
+            "ollama_server",
+            "remove_downloaded_on_error",
+            defaults.remove_downloaded_on_error.to_string(),
+            Value::Bool(defaults.remove_downloaded_on_error),
+        );
+        Self::insert_default_if_missing(
+            ollama_server,
+            "ollama_server",
+            "check_model_presence",
+            defaults.check_model_presence.to_string(),
+            Value::Bool(defaults.check_model_presence),
+        );
+        Self::insert_default_if_missing(
+            ollama_server,
+            "ollama_server",
+            "keep_verified_blobs_on_error",
+            defaults.keep_verified_blobs_on_error.to_string(),
+            Value::Bool(defaults.keep_verified_blobs_on_error),
+        );
+    }
+
+    fn fill_missing_ollama_library_defaults(ollama_library: &mut Map<String, Value>) {
+        let defaults = OllamaLibrary::default();
+
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "models_path",
+            defaults.models_path.clone(),
+            Value::String(defaults.models_path),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "registry_base_url",
+            defaults.registry_base_url.clone(),
+            Value::String(defaults.registry_base_url),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "library_base_url",
+            defaults.library_base_url.clone(),
+            Value::String(defaults.library_base_url),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "verify_ssl",
+            defaults.verify_ssl.to_string(),
+            Value::Bool(defaults.verify_ssl),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "timeout",
+            defaults.timeout.to_string(),
+            Value::Number(serde_json::Number::from_f64(defaults.timeout).unwrap()),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "chunk_size_mib",
+            defaults.chunk_size_mib.to_string(),
+            Value::Number(serde_json::Number::from(defaults.chunk_size_mib)),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "download_chunks_in_parallel",
+            defaults.download_chunks_in_parallel.to_string(),
+            Value::Bool(defaults.download_chunks_in_parallel),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "transient_cleanup_enabled",
+            defaults.transient_cleanup_enabled.to_string(),
+            Value::Bool(defaults.transient_cleanup_enabled),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "transient_ttl_hours",
+            defaults.transient_ttl_hours.to_string(),
+            Value::Number(serde_json::Number::from(defaults.transient_ttl_hours)),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "failed_journal_ttl_hours",
+            defaults.failed_journal_ttl_hours.to_string(),
+            Value::Number(serde_json::Number::from(defaults.failed_journal_ttl_hours)),
+        );
+        Self::insert_default_if_missing(
+            ollama_library,
+            "ollama_library",
+            "completed_journal_ttl_hours",
+            defaults.completed_journal_ttl_hours.to_string(),
+            Value::Number(serde_json::Number::from(
+                defaults.completed_journal_ttl_hours,
+            )),
+        );
+    }
+
     /// Validate all HTTP URLs in the settings.
     ///
     /// # Returns
@@ -214,40 +387,7 @@ impl AppSettings {
             .and_then(|v| v.as_object_mut())
             .map(|obj| obj.clone())
             .unwrap_or_default();
-
-        // Fill in missing ollama_server fields with defaults
-        let defaults = OllamaServer::default();
-        if !ollama_server.contains_key("url") {
-            warn!(
-                "Missing field 'ollama_server.url', using default: {}",
-                defaults.url
-            );
-            ollama_server.insert("url".to_string(), Value::String(defaults.url));
-        }
-        if !ollama_server.contains_key("api_key") {
-            warn!("Missing field 'ollama_server.api_key', using default: None");
-            ollama_server.insert("api_key".to_string(), Value::Null);
-        }
-        if !ollama_server.contains_key("remove_downloaded_on_error") {
-            warn!(
-                "Missing field 'ollama_server.remove_downloaded_on_error', using default: {}",
-                defaults.remove_downloaded_on_error
-            );
-            ollama_server.insert(
-                "remove_downloaded_on_error".to_string(),
-                Value::Bool(defaults.remove_downloaded_on_error),
-            );
-        }
-        if !ollama_server.contains_key("check_model_presence") {
-            warn!(
-                "Missing field 'ollama_server.check_model_presence', using default: {}",
-                defaults.check_model_presence
-            );
-            ollama_server.insert(
-                "check_model_presence".to_string(),
-                Value::Bool(defaults.check_model_presence),
-            );
-        }
+        Self::fill_missing_ollama_server_defaults(&mut ollama_server);
 
         // Get or create the ollama_library object
         let mut ollama_library = parsed
@@ -255,76 +395,7 @@ impl AppSettings {
             .and_then(|v| v.as_object_mut())
             .map(|obj| obj.clone())
             .unwrap_or_default();
-
-        // Fill in missing ollama_library fields with defaults
-        let defaults = OllamaLibrary::default();
-        if !ollama_library.contains_key("models_path") {
-            warn!(
-                "Missing field 'ollama_library.models_path', using default: {}",
-                defaults.models_path
-            );
-            ollama_library.insert(
-                "models_path".to_string(),
-                Value::String(defaults.models_path),
-            );
-        }
-        if !ollama_library.contains_key("registry_base_url") {
-            warn!(
-                "Missing field 'ollama_library.registry_base_url', using default: {}",
-                defaults.registry_base_url
-            );
-            ollama_library.insert(
-                "registry_base_url".to_string(),
-                Value::String(defaults.registry_base_url),
-            );
-        }
-        if !ollama_library.contains_key("library_base_url") {
-            warn!(
-                "Missing field 'ollama_library.library_base_url', using default: {}",
-                defaults.library_base_url
-            );
-            ollama_library.insert(
-                "library_base_url".to_string(),
-                Value::String(defaults.library_base_url),
-            );
-        }
-        if !ollama_library.contains_key("verify_ssl") {
-            warn!(
-                "Missing field 'ollama_library.verify_ssl', using default: {}",
-                defaults.verify_ssl
-            );
-            ollama_library.insert("verify_ssl".to_string(), Value::Bool(defaults.verify_ssl));
-        }
-        if !ollama_library.contains_key("timeout") {
-            warn!(
-                "Missing field 'ollama_library.timeout', using default: {}",
-                defaults.timeout
-            );
-            ollama_library.insert(
-                "timeout".to_string(),
-                Value::Number(serde_json::Number::from_f64(defaults.timeout).unwrap()),
-            );
-        }
-        if !ollama_library.contains_key("chunk_size_mib") {
-            warn!(
-                "Missing field 'ollama_library.chunk_size_mib', using default: {}",
-                defaults.chunk_size_mib
-            );
-            ollama_library.insert(
-                "chunk_size_mib".to_string(),
-                Value::Number(serde_json::Number::from(defaults.chunk_size_mib)),
-            );
-        }
-        if !ollama_library.contains_key("download_chunks_in_parallel") {
-            warn!(
-                "Missing field 'ollama_library.download_chunks_in_parallel', using default: {}",
-                defaults.download_chunks_in_parallel
-            );
-            ollama_library.insert(
-                "download_chunks_in_parallel".to_string(),
-                Value::Bool(defaults.download_chunks_in_parallel),
-            );
-        }
+        Self::fill_missing_ollama_library_defaults(&mut ollama_library);
 
         // Reconstruct the settings object with filled-in values
         let settings_object = json!({
@@ -442,6 +513,16 @@ pub fn get_settings_file_path() -> Result<PathBuf, io::Error> {
     get_settings_file_path_for_dir(proj_dirs.config_dir())
 }
 
+/// Get the path to the journal directory using OS-standard user data directories.
+///
+/// Returns `<data_local_dir>/journals` and creates it if needed.
+pub fn get_journal_dir_path() -> Result<PathBuf, io::Error> {
+    let proj_dirs = ProjectDirs::from("", "", "odir").expect("Failed to determine data directory");
+    let journal_dir = proj_dirs.data_local_dir().join("journals");
+    fs::create_dir_all(&journal_dir)?;
+    Ok(journal_dir)
+}
+
 /// Get the path to the settings file and panic on error.
 ///
 /// # Panics
@@ -461,19 +542,54 @@ fn settings_path_or_panic(result: Result<PathBuf, io::Error>) -> PathBuf {
 
 /// Get the user agent string for HTTP requests.
 ///
-/// Returns a string in the format "odir/{version}".
+/// Returns the `OD_UA` override when set; otherwise returns a string in the
+/// format `odir/{version} ({arch} {os})` using Ollama-compatible lower-case
+/// platform names.
 ///
 /// # Returns
 /// * `String` - User agent string
 pub fn get_user_agent() -> String {
-    format!("odir/{}", env!("CARGO_PKG_VERSION"))
+    if let Ok(user_agent) = env::var("OD_UA") {
+        let trimmed = user_agent.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    format!(
+        "odir/{} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        get_native_arch_name(),
+        get_native_os_name()
+    )
+}
+
+fn get_native_os_name() -> &'static str {
+    match env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn get_native_arch_name() -> &'static str {
+    match env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Initialize logger for tests to enable log coverage
     fn init_test_logger() {
@@ -505,6 +621,59 @@ mod tests {
     fn test_get_user_agent() {
         let user_agent = get_user_agent();
         assert!(user_agent.starts_with("odir/"));
+        assert!(user_agent.contains(" ("));
+        assert!(user_agent.ends_with(&format!(" {})", get_native_os_name())));
+    }
+
+    #[test]
+    fn test_get_native_platform_names() {
+        assert_eq!(get_native_os_name(), expected_os_name(env::consts::OS));
+        assert_eq!(
+            get_native_arch_name(),
+            expected_arch_name(env::consts::ARCH)
+        );
+    }
+
+    #[test]
+    fn test_get_user_agent_uses_od_ua_override() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("OD_UA");
+        }
+
+        let default_user_agent = get_user_agent();
+        assert!(default_user_agent.starts_with("odir/"));
+
+        unsafe {
+            env::set_var("OD_UA", "odir/v0.1.1 (arm64 darwin)");
+        }
+
+        assert_eq!(get_user_agent(), "odir/v0.1.1 (arm64 darwin)");
+
+        unsafe {
+            env::set_var("OD_UA", "   ");
+        }
+
+        assert_eq!(get_user_agent(), default_user_agent);
+
+        unsafe {
+            env::remove_var("OD_UA");
+        }
+    }
+
+    fn expected_os_name(os: &str) -> &str {
+        match os {
+            "macos" => "darwin",
+            other => other,
+        }
+    }
+
+    fn expected_arch_name(arch: &str) -> &str {
+        match arch {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            other => other,
+        }
     }
 
     #[test]
@@ -555,7 +724,7 @@ mod tests {
     #[test]
     fn test_default_ollama_library() {
         let library = OllamaLibrary::default();
-        assert_eq!(library.models_path, "~/.ollama/models");
+        assert_eq!(library.models_path, default_models_path());
         assert_eq!(
             library.registry_base_url,
             "https://registry.ollama.ai/v2/library/"
@@ -685,7 +854,7 @@ mod tests {
         // Check that provided values are preserved
         assert_eq!(settings.ollama_server.url, "http://localhost:11434/");
         assert_eq!(settings.ollama_server.remove_downloaded_on_error, true);
-        assert_eq!(settings.ollama_library.models_path, "~/.ollama/models");
+        assert_eq!(settings.ollama_library.models_path, default_models_path());
 
         // Check that missing values use defaults
         assert_eq!(settings.ollama_server.api_key, None);
