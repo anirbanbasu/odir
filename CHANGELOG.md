@@ -6,19 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ## [unreleased]
 
-This set of changes will constitute the next release, which will be version [0.1.1].
-
 ### Added
 
-- Improved coverage but this is still ongoing.
-- Added support for chunked downloading of large model blobs, which makes downloads more robust over unreliable connections.
-- Added support for resuming multi-layer models downloads, which can be interrupted (intentionally or not) and resumed without starting over.
-- Added a new `journal` command to view the status of succeeded, pending, and failed downloads.
+- None documented yet.
 
 ### Changed
 
-- The default HTTP user-agent now includes normalized architecture and operating system names, for example `odir/0.1.1 (arm64 darwin)`.
-- Added `OD_UA` environment variable support to override the HTTP user-agent used by ODIR.
+- None documented yet.
 
 ### Deprecated
 
@@ -35,6 +29,20 @@ This set of changes will constitute the next release, which will be version [0.1
 ### Security
 
 - None documented yet.
+
+## [0.1.1] - 2026-04-08
+
+### Added
+
+- Improved coverage but this is still ongoing.
+- Added support for chunked downloading of large model blobs, which makes downloads more robust over unreliable connections.
+- Added support for resuming multi-layer models downloads, which can be interrupted (intentionally or not) and resumed without starting over.
+- Added a new `journal` command to view the status of succeeded, pending, and failed downloads.
+
+### Changed
+
+- The default HTTP user-agent now includes normalized architecture and operating system names, for example `odir/0.1.1 (arm64 darwin)`.
+- Added `OD_UA` environment variable support to override the HTTP user-agent used by ODIR.
 
 ## [0.1.0] - 2026-02-20
 
