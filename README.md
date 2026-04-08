@@ -1,6 +1,6 @@
 # Ollama Downloader in Rust (ODIR or _oh dear_)
 
-[![Rust tests](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml) [![Markdown Lint](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml) [![CodeQL Advanced](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/anirbanbasu/odir/badge)](https://scorecard.dev/viewer/?uri=github.com/anirbanbasu/odir) [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/11975/badge)](https://www.bestpractices.dev/projects/11975)
+[![Rust tests](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/rust.yml) [![Markdown Lint](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/md-lint.yml) [![CodeQL Advanced](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml/badge.svg)](https://github.com/anirbanbasu/odir/actions/workflows/codeql.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/anirbanbasu/odir/badge)](https://scorecard.dev/viewer/?uri=github.com/anirbanbasu/odir) [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/11975/badge)](https://www.bestpractices.dev/projects/11975) ![crates.io](https://img.shields.io/crates/v/odir.svg)  
 
 
 Ollama Downloader in Rust (ODIR), pronounced _oh dear_, is a command-line tool written in Rust for downloading models from Ollama. A successor of the original Python implementation called [Ollama Downloader](https://github.com/anirbanbasu/ollama-downloader), ODIR has been rewritten in Rust to leverage its performance and safety features.
@@ -45,7 +45,17 @@ The current preferred way is to download and compile the source from the HEAD of
 cargo install --git https://github.com/anirbanbasu/odir
 ```
 
-_Note that other methods of installation will be available in the future_.
+If you want to install the latest released version, you can install it directly from crates.io by running the following command.
+
+```bash
+cargo install odir
+```
+
+There is also a Homebrew formula for ODIR, which may be sometimes less up-to-date than the Cargo installation. You can install it using Homebrew with the following command.
+
+```bash
+brew install anirbanbasu/tap/odir
+```
 
 ## Configuration
 
@@ -63,7 +73,7 @@ Let's explore the configuration in details. The default content is as follows.
         "keep_verified_blobs_on_error": true
     },
     "ollama_library": {
-        "models_path": "/home/username/.ollama/models",
+        "models_path": "$HOME/.ollama/models",
         "registry_base_url": "https://registry.ollama.ai/v2/library/",
         "library_base_url": "https://ollama.com/library",
         "verify_ssl": true,
@@ -90,7 +100,7 @@ There are two main configuration groups: `ollama_server` and `ollama_library`. T
 
 ### `ollama_library`
 
-- The `models_path` points to the models directory of your Ollama installation. On Linux/UNIX systems, if it has been installed for your own user only then the path is the default `~/.ollama/models`. If it has been installed as a service, however, it could be, for example on Ubuntu, `/usr/share/ollama/.ollama/models`. Also note that the path could be a network share, if Ollama is on a different machine. If the path is not in the current user directory, on a Linux/UNIX system, you may need to run ODIR using `sudo` to have the necessary permissions to write to that path.
+- The `models_path` points to the models directory of your Ollama installation. On Linux/UNIX systems, if it has been installed for your own user only then the path is the default `$HOME/.ollama/models`. If it has been installed as a service, however, it could be, for example on Ubuntu, `/usr/share/ollama/.ollama/models`. Also note that the path could be a network share, if Ollama is on a different machine. If the path is not in the current user directory, on a Linux/UNIX system, you may need to run ODIR using `sudo` to have the necessary permissions to write to that path.
 - The `registry_base_url` is the URL to the Ollama registry. Unless you have a custom Ollama registry, use the default value as shown above.
 - Likewise, the `library_base_url` is the URL to the Ollama library. Keep the default value unless you really need to point it to some mirror.
 - The `verify_ssl` is a flag that tells the downloader tool to verify the authenticity of the HTTPS connections it makes to the Ollama registry or the library. Turn this off only if you have a man-in-the-middle proxy with self-signed certificates. Even in that case, typically environment variables `SSL_CERT_FILE` and `SSL_CERT_DIR` can be correctly configured to validate such certificates.
