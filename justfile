@@ -107,3 +107,9 @@ vulnerability-scan:
     @echo "Running Open Source Vulnerability scanner..."
     @osv-scanner scan source -r .
     @echo "Vulnerability scan complete."
+
+# Publish the crate to crates.io
+publish:
+    @echo "Publishing crate to crates.io..."
+    @cargo publish --locked
+    @echo "Crate published to crates.io."
