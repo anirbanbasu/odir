@@ -73,7 +73,7 @@ Let's explore the configuration in details. The default content is as follows.
         "keep_verified_blobs_on_error": true
     },
     "ollama_library": {
-        "models_path": "/home/username/.ollama/models",
+        "models_path": "$HOME/.ollama/models",
         "registry_base_url": "https://registry.ollama.ai/v2/library/",
         "library_base_url": "https://ollama.com/library",
         "verify_ssl": true,
@@ -100,7 +100,7 @@ There are two main configuration groups: `ollama_server` and `ollama_library`. T
 
 ### `ollama_library`
 
-- The `models_path` points to the models directory of your Ollama installation. On Linux/UNIX systems, if it has been installed for your own user only then the path is the default `/home/username/.ollama/models`. If it has been installed as a service, however, it could be, for example on Ubuntu, `/usr/share/ollama/.ollama/models`. Also note that the path could be a network share, if Ollama is on a different machine. If the path is not in the current user directory, on a Linux/UNIX system, you may need to run ODIR using `sudo` to have the necessary permissions to write to that path.
+- The `models_path` points to the models directory of your Ollama installation. On Linux/UNIX systems, if it has been installed for your own user only then the path is the default `$HOME/.ollama/models`. If it has been installed as a service, however, it could be, for example on Ubuntu, `/usr/share/ollama/.ollama/models`. Also note that the path could be a network share, if Ollama is on a different machine. If the path is not in the current user directory, on a Linux/UNIX system, you may need to run ODIR using `sudo` to have the necessary permissions to write to that path.
 - The `registry_base_url` is the URL to the Ollama registry. Unless you have a custom Ollama registry, use the default value as shown above.
 - Likewise, the `library_base_url` is the URL to the Ollama library. Keep the default value unless you really need to point it to some mirror.
 - The `verify_ssl` is a flag that tells the downloader tool to verify the authenticity of the HTTPS connections it makes to the Ollama registry or the library. Turn this off only if you have a man-in-the-middle proxy with self-signed certificates. Even in that case, typically environment variables `SSL_CERT_FILE` and `SSL_CERT_DIR` can be correctly configured to validate such certificates.

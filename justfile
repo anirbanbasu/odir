@@ -158,8 +158,9 @@ brew-formula-advise release_tag repo_base_url="" formula_url="":
         gh_repo="${BASH_REMATCH[2]}"
         gh_release_api_url="https://api.github.com/repos/$gh_owner/$gh_repo/releases/tags/$release_tag"
         if ! curl -fsSL "$gh_release_api_url" >/dev/null 2>&1; then
-            echo "The $release_tag is not a valid release."
-            exit 0
+            echo "Failed to validate GitHub release tag '$release_tag' via $gh_release_api_url." >&2
+            echo "The tag may be invalid, or the lookup may have failed due to rate limiting or network/API issues." >&2
+            exit 1
         fi
     fi
 
@@ -183,8 +184,8 @@ brew-formula-advise release_tag repo_base_url="" formula_url="":
     trap 'rm -f "$tmp_archive"' EXIT
 
     if ! curl -fsSL -o "$tmp_archive" "$release_tarball_url" >/dev/null 2>&1; then
-        echo "The release tarball $release_tarball_url does not exist."
-        exit 0
+        echo "Failed to download release tarball: $release_tarball_url" >&2
+        exit 1
     fi
 
     if [[ "$hash_cmd" == "shasum -a 256" ]]; then
