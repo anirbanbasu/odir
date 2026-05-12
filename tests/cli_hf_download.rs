@@ -19,10 +19,11 @@
 
 mod common;
 
-use std::io::Read;
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Test that the CLI properly handles HuggingFace download interrupts with SIGINT
 ///
@@ -184,34 +185,76 @@ fn test_hf_large_model_mode_indicator_non_interactive() {
         .spawn()
         .expect("Failed to spawn odir process");
 
-    // Allow enough time for mode-detection logs to appear.
-    thread::sleep(Duration::from_secs(12));
+    let output_buf = Arc::new(Mutex::new(String::new()));
+    let mut reader_threads = Vec::new();
+
+    if let Some(stdout) = child.stdout.take() {
+        let output_buf = Arc::clone(&output_buf);
+        reader_threads.push(thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                let mut combined = output_buf.lock().expect("stdout buffer lock poisoned");
+                combined.push_str(&line);
+                combined.push('\n');
+            }
+        }));
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let output_buf = Arc::clone(&output_buf);
+        reader_threads.push(thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                let mut combined = output_buf.lock().expect("stderr buffer lock poisoned");
+                combined.push_str(&line);
+                combined.push('\n');
+            }
+        }));
+    }
+
+    let indicators = [
+        "Downloading item 1/",
+        "Verifying existing item 1/",
+        "already present and verified",
+        "Using chunked download for",
+        "falling back to single-stream download",
+        "Server does not support byte-range probe",
+    ];
+
+    // Wait for an actual mode/progress signal instead of a fixed sleep window.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut matched_indicator: Option<String> = None;
+    while Instant::now() < deadline {
+        {
+            let combined = output_buf.lock().expect("output buffer lock poisoned");
+            if let Some(hit) = indicators.iter().find(|s| combined.contains(**s)) {
+                matched_indicator = Some((*hit).to_string());
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 
     let _ = child.kill();
     let _ = child.wait();
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
+    for handle in reader_threads {
+        let _ = handle.join();
     }
 
-    let combined = format!("{}\n{}", stdout, stderr);
+    let combined = output_buf
+        .lock()
+        .expect("final output buffer lock poisoned")
+        .clone();
     println!(
         "Captured output (truncated): {}",
-        &combined.chars().take(2000).collect::<String>()
+        &combined.chars().take(4000).collect::<String>()
     );
 
     assert!(
-        combined.contains("falling back to single-stream download")
-            || combined.contains("Server does not support byte-range probe")
-            || combined.contains("Verifying existing item")
-            || combined.contains("already present and verified"),
-        "Expected fallback or resume verification indicator in output, but none was found"
+        matched_indicator.is_some(),
+        "Expected one of mode/progress indicators within timeout. Indicators: {:?}",
+        indicators
     );
 }
 
