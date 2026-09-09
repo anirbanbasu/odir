@@ -722,7 +722,7 @@ mod tests {
                     }
                     set_confirmation_required(!bit);
                     set_progress_active(bit);
-                    PENDING_SIGNAL.store((i % 3) as usize, Ordering::Release);
+                    PENDING_SIGNAL.store(i % 3, Ordering::Release);
                 }
             }));
         }
