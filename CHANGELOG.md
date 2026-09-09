@@ -30,6 +30,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 - None documented yet.
 
+## [0.2.0] - 2026-09-09
+
+### Added
+
+- Added automatic retrying of failed downloads with exponential backoff, configurable via a new `download_retry` settings section (`enabled`, `max_retries`, `initial_backoff_ms`, `max_backoff_ms`). Only plausibly transient errors are retried (network/IO errors and HTTP 5xx/429/408 responses); the retry budget resets whenever a failure occurs at a different download stage than the previous one, so downloads making genuine progress aren't penalised for unrelated earlier setbacks.
+- ODIR now offers to persist healed settings back to the configuration file when loading interactively, so a `settings.json` predating a newer field (e.g. the `download_retry` section) is no longer silently re-healed and re-warned about on every invocation. The prompt is skipped when stdin is non-interactive (scripts, cron jobs).
+
+### Fixed
+
+- `hf-list-tags` no longer advertises Hugging Face GGUF quantisation tags that the manifest registry doesn't recognise. Each candidate tag is now probed against the manifest endpoint and only returned if it resolves, falling back to `:latest` when none do, preventing a subsequent `hf-model-download` from failing with HTTP 400.
+
 ## [0.1.1] - 2026-04-08
 
 ### Added
@@ -65,6 +76,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 - Added Open Source Vulnerability (OSV) analysis.
 
 
-[unreleased]: https://github.com/anirbanbasu/odir/compare/v0.1.1...HEAD
+[unreleased]: https://github.com/anirbanbasu/odir/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/anirbanbasu/odir/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/anirbanbasu/odir/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/anirbanbasu/odir/compare/v0.0.1...v0.1.0
