@@ -21,3 +21,6 @@ target
 #.idea/
 
 .env
+
+# Claude Code session memory
+.remember/
