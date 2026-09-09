@@ -613,7 +613,7 @@ impl ModelDownloader for HuggingFaceModelDownloader {
         }
 
         let model_info: HfModelInfo = response.json()?;
-        let mut tags: Vec<String> = Vec::new();
+        let mut candidate_tags: Vec<String> = Vec::new();
 
         for sibling in model_info.siblings {
             if sibling.rfilename.ends_with(".gguf") {
@@ -624,16 +624,50 @@ impl ModelDownloader for HuggingFaceModelDownloader {
                     .strip_suffix(".gguf")
                     .and_then(|s| s.split('-').next_back())
                 {
-                    tags.push(format!("{}:{}", model_identifier, tag_part));
+                    candidate_tags.push(tag_part.to_string());
                 }
             }
         }
 
-        if tags.is_empty() {
+        if candidate_tags.is_empty() {
             return Err(DownloaderError::Other(format!(
                 "The model {} has no support for Ollama (no .gguf files found)",
                 model_identifier
             )));
+        }
+
+        // The filename-derived tag above is only a guess: Hugging Face's manifest
+        // registry accepts a repository-specific set of quantisation scheme names
+        // and returns HTTP 400 for anything else (e.g. shorthand like "q4" or
+        // "fp16" instead of a recognised scheme such as "Q4_K_M"). Probe each
+        // candidate against the manifest endpoint so we only advertise tags that
+        // are actually downloadable.
+        let mut tags: Vec<String> = Vec::new();
+        for tag_part in candidate_tags {
+            let candidate = format!("{}:{}", model_identifier, tag_part);
+            let url = self.make_manifest_url(&candidate);
+            match self.client.head(&url).send() {
+                Ok(response) if response.status().is_success() => tags.push(candidate),
+                Ok(response) => debug!(
+                    "Discarding tag '{}' for {}: manifest check returned {}",
+                    tag_part,
+                    model_identifier,
+                    response.status()
+                ),
+                Err(e) => debug!(
+                    "Discarding tag '{}' for {}: manifest check failed: {}",
+                    tag_part, model_identifier, e
+                ),
+            }
+        }
+
+        if tags.is_empty() {
+            warn!(
+                "None of the quantisation tags advertised by {} are recognised by the \
+                Hugging Face registry; only \"latest\" is downloadable",
+                model_identifier
+            );
+            tags.push(format!("{}:latest", model_identifier));
         }
 
         // Sort case-insensitively
@@ -685,6 +719,48 @@ mod tests {
         assert!(
             !tags.is_empty(),
             "Should return at least some tags for the model"
+        );
+
+        // Regression test for https://github.com/anirbanbasu/odir/issues/4:
+        // every advertised tag must actually resolve on the manifest endpoint,
+        // otherwise a subsequent hf-model-download is guaranteed to fail.
+        for tag in &tags {
+            let url = downloader.make_manifest_url(tag);
+            let response = downloader
+                .client
+                .head(&url)
+                .send()
+                .unwrap_or_else(|e| panic!("manifest check request failed for {}: {}", tag, e));
+            assert!(
+                response.status().is_success(),
+                "advertised tag {} does not resolve on the manifest endpoint (status {})",
+                tag,
+                response.status()
+            );
+        }
+    }
+
+    #[test]
+    fn test_hf_list_tags_falls_back_to_latest_for_unrecognised_quant_schemes() {
+        let settings = AppSettings::default();
+        let downloader =
+            HuggingFaceModelDownloader::new(settings).expect("Failed to create downloader");
+
+        // This model's GGUF filenames use shorthand quantisation names ("fp16",
+        // "q4") that Hugging Face's manifest registry does not recognise as valid
+        // tags, so only "latest" is actually downloadable. See issue #4.
+        let model = "microsoft/Phi-3-mini-4k-instruct-gguf";
+        let result = downloader.list_model_tags(model);
+
+        assert!(
+            result.is_ok(),
+            "list_model_tags should succeed even when no per-quant tag resolves"
+        );
+        let tags = result.unwrap();
+        assert_eq!(
+            tags,
+            vec![format!("{}:latest", model)],
+            "should fall back to the sole downloadable tag instead of advertising broken ones"
         );
     }
 }
