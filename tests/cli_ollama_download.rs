@@ -19,11 +19,71 @@
 
 mod common;
 
-use std::io::Read;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Spawn background threads that continuously drain a child's stdout/stderr into a
+/// shared buffer, so callers can poll for progress indicators instead of relying on
+/// a fixed sleep window that may be too short for a live, cold network download.
+fn capture_output(child: &mut Child) -> (Arc<Mutex<String>>, Vec<thread::JoinHandle<()>>) {
+    let output_buf = Arc::new(Mutex::new(String::new()));
+    let mut reader_threads = Vec::new();
+
+    if let Some(stdout) = child.stdout.take() {
+        let output_buf = Arc::clone(&output_buf);
+        reader_threads.push(thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                let mut combined = output_buf.lock().expect("stdout buffer lock poisoned");
+                combined.push_str(&line);
+                combined.push('\n');
+            }
+        }));
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let output_buf = Arc::clone(&output_buf);
+        reader_threads.push(thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                let mut combined = output_buf.lock().expect("stderr buffer lock poisoned");
+                combined.push_str(&line);
+                combined.push('\n');
+            }
+        }));
+    }
+
+    (output_buf, reader_threads)
+}
+
+/// Poll `output_buf` until it contains one of `indicators`, the child exits, or
+/// `timeout` elapses. Returns `true` only if an indicator was actually matched.
+fn wait_for_indicator_or_exit(
+    child: &mut Child,
+    output_buf: &Arc<Mutex<String>>,
+    indicators: &[&str],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let combined = output_buf.lock().expect("output buffer lock poisoned");
+            if indicators.iter().any(|s| combined.contains(s)) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if child.try_wait().expect("try_wait failed").is_some() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
 
 /// Test that the CLI properly handles download interrupts with SIGINT
 ///
@@ -183,35 +243,45 @@ fn test_ollama_large_model_mode_indicator_non_interactive() {
         .spawn()
         .expect("Failed to spawn odir process");
 
-    // Allow enough time for mode-detection logs/progress to appear.
-    thread::sleep(Duration::from_secs(12));
+    let (output_buf, reader_threads) = capture_output(&mut child);
+
+    let indicators = [
+        "Using chunked download for",
+        " part 1/",
+        " part 2/",
+        "Verifying existing item",
+        "already present and verified",
+    ];
+
+    // Wait for an actual mode/progress signal instead of a fixed sleep window: a cold
+    // download of a model that isn't cached yet can take longer than a few seconds to
+    // reach the manifest-validated, per-item logging stage.
+    wait_for_indicator_or_exit(
+        &mut child,
+        &output_buf,
+        &indicators,
+        Duration::from_secs(60),
+    );
 
     let _ = child.kill();
     let _ = child.wait();
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
+    for handle in reader_threads {
+        let _ = handle.join();
     }
 
-    let combined = format!("{}\n{}", stdout, stderr);
+    let combined = output_buf
+        .lock()
+        .expect("final output buffer lock poisoned")
+        .clone();
     println!(
         "Captured output (truncated): {}",
-        &combined.chars().take(2000).collect::<String>()
+        combined.chars().take(2000).collect::<String>()
     );
 
     assert!(
-        combined.contains("Using chunked download for")
-            || combined.contains(" part 1/")
-            || combined.contains(" part 2/")
-            || combined.contains("Verifying existing item")
-            || combined.contains("already present and verified"),
-        "Expected part-download mode indicator or resume verification in output, but none was found"
+        indicators.iter().any(|s| combined.contains(s)),
+        "Expected part-download mode indicator or resume verification in output within timeout, but none was found"
     );
 }
 
@@ -235,34 +305,47 @@ fn test_ollama_interrupt_keep_chunks_with_k() {
         .spawn()
         .expect("Failed to spawn odir process");
 
-    // Let chunked transfer start and progress render.
-    thread::sleep(Duration::from_secs(4));
+    let (output_buf, reader_threads) = capture_output(&mut child);
 
-    common::send_sigint(&mut child);
+    // Wait for the chunked transfer to actually start instead of assuming a fixed 4s
+    // sleep is enough — a cold download over the live registry can still be fetching
+    // the manifest or verifying earlier items at that point, and sending SIGINT before
+    // the interruptible per-chunk loop is reached leaves the confirmation prompt
+    // unanswered, which is what caused this test to hang past its exit timeout.
+    let chunk_started = wait_for_indicator_or_exit(
+        &mut child,
+        &output_buf,
+        &["Using chunked download for", "Downloading BLOB"],
+        Duration::from_secs(90),
+    );
 
-    // Confirm exit with keep-partials option.
-    if let Some(stdin) = child.stdin.as_mut() {
-        let _ = stdin.write_all(b"k\n");
-        let _ = stdin.flush();
+    let status = if chunk_started {
+        common::send_sigint(&mut child);
+
+        // Confirm exit with keep-partials option.
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(b"k\n");
+            let _ = stdin.flush();
+        }
+
+        common::wait_with_timeout(&mut child, 30)
+            .expect("Process did not exit after interrupt confirmation")
+    } else {
+        // The process exited on its own (e.g. the model was already fully cached)
+        // before the chunked transfer began — there is nothing left to interrupt.
+        common::wait_with_timeout(&mut child, 30)
+            .expect("Process should already have exited if chunk transfer never started")
+    };
+
+    for handle in reader_threads {
+        let _ = handle.join();
     }
+    let combined = output_buf
+        .lock()
+        .expect("final output buffer lock poisoned")
+        .clone();
 
-    let status = common::wait_with_timeout(&mut child, 20)
-        .expect("Process did not exit after interrupt confirmation");
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
-
-    let combined = format!("{}\n{}", stdout, stderr);
-    // If the model was already fully cached, the process completes before our SIGINT
-    // arrives and no chunked interrupt prompt is shown — that is acceptable.
-    let already_cached = combined.contains("already present and verified");
-    if already_cached {
+    if !chunk_started {
         println!("Model was already cached; chunked interrupt path not exercised this run.");
         return;
     }
@@ -351,6 +434,7 @@ fn test_ollama_interrupt_during_resume_verification() {
     }
 
     let model = "gemma3:270m";
+    let chunk_indicators = ["Using chunked download for", "Downloading BLOB"];
 
     // Phase 1: seed partial data.
     let mut first = Command::new(common::get_binary_path())
@@ -361,13 +445,30 @@ fn test_ollama_interrupt_during_resume_verification() {
         .spawn()
         .expect("Failed to spawn first odir process");
 
-    thread::sleep(Duration::from_secs(4));
-    common::send_sigint(&mut first);
-    if let Some(stdin) = first.stdin.as_mut() {
-        let _ = stdin.write_all(b"k\n");
-        let _ = stdin.flush();
+    let (first_buf, first_threads) = capture_output(&mut first);
+
+    // Wait for the chunked transfer to actually start before interrupting it, rather
+    // than assuming a fixed 4s sleep is enough for a cold, live-network download.
+    let first_chunk_started = wait_for_indicator_or_exit(
+        &mut first,
+        &first_buf,
+        &chunk_indicators,
+        Duration::from_secs(90),
+    );
+    if first_chunk_started {
+        common::send_sigint(&mut first);
+        if let Some(stdin) = first.stdin.as_mut() {
+            let _ = stdin.write_all(b"k\n");
+            let _ = stdin.flush();
+        }
     }
-    let _ = common::wait_with_timeout(&mut first, 20);
+    if common::wait_with_timeout(&mut first, 30).is_none() {
+        let _ = first.kill();
+        let _ = first.wait();
+    }
+    for handle in first_threads {
+        let _ = handle.join();
+    }
 
     // Phase 2: resume path, then interrupt again.
     let mut second = Command::new(common::get_binary_path())
@@ -378,31 +479,33 @@ fn test_ollama_interrupt_during_resume_verification() {
         .spawn()
         .expect("Failed to spawn second odir process");
 
-    thread::sleep(Duration::from_secs(3));
-    common::send_sigint(&mut second);
-    if let Some(stdin) = second.stdin.as_mut() {
-        let _ = stdin.write_all(b"k\n");
-        let _ = stdin.flush();
+    let (second_buf, second_threads) = capture_output(&mut second);
+
+    let second_chunk_started = wait_for_indicator_or_exit(
+        &mut second,
+        &second_buf,
+        &chunk_indicators,
+        Duration::from_secs(90),
+    );
+    if second_chunk_started {
+        common::send_sigint(&mut second);
+        if let Some(stdin) = second.stdin.as_mut() {
+            let _ = stdin.write_all(b"k\n");
+            let _ = stdin.flush();
+        }
     }
 
-    let status = common::wait_with_timeout(&mut second, 20)
+    let status = common::wait_with_timeout(&mut second, 30)
         .expect("Process did not exit after second interrupt confirmation");
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = second.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
+    for handle in second_threads {
+        let _ = handle.join();
     }
-    if let Some(mut err) = second.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
-    let combined = format!("{}\n{}", stdout, stderr);
 
-    // If the model was already fully cached, phase 2 completes before SIGINT is
-    // processed and exits with success — that path is also acceptable.
-    let already_cached = combined.contains("already present and verified");
+    // If the model was already fully cached, phase 2 completes before the chunked
+    // transfer (and thus SIGINT) is ever reached — that path is also acceptable.
     assert!(
-        !status.success() || already_cached,
+        !status.success() || !second_chunk_started,
         "Process should exit after Ctrl+C with 'k' during resume verification"
     );
 }

@@ -717,8 +717,8 @@ mod tests {
         let server = OllamaServer::default();
         assert_eq!(server.url, "http://localhost:11434/");
         assert_eq!(server.api_key, None);
-        assert_eq!(server.remove_downloaded_on_error, true);
-        assert_eq!(server.check_model_presence, true);
+        assert!(server.remove_downloaded_on_error);
+        assert!(server.check_model_presence);
     }
 
     #[test]
@@ -730,7 +730,7 @@ mod tests {
             "https://registry.ollama.ai/v2/library/"
         );
         assert_eq!(library.library_base_url, "https://ollama.com/library/");
-        assert_eq!(library.verify_ssl, true);
+        assert!(library.verify_ssl);
         assert_eq!(library.timeout, 120.0);
         assert!(library.download_chunks_in_parallel);
     }
@@ -853,12 +853,12 @@ mod tests {
         let settings = result.unwrap();
         // Check that provided values are preserved
         assert_eq!(settings.ollama_server.url, "http://localhost:11434/");
-        assert_eq!(settings.ollama_server.remove_downloaded_on_error, true);
+        assert!(settings.ollama_server.remove_downloaded_on_error);
         assert_eq!(settings.ollama_library.models_path, default_models_path());
 
         // Check that missing values use defaults
         assert_eq!(settings.ollama_server.api_key, None);
-        assert_eq!(settings.ollama_server.check_model_presence, true); // default
+        assert!(settings.ollama_server.check_model_presence); // default
         assert_eq!(
             settings.ollama_library.registry_base_url,
             "https://registry.ollama.ai/v2/library/"
@@ -867,7 +867,7 @@ mod tests {
             settings.ollama_library.library_base_url,
             "https://ollama.com/library/"
         ); // default
-        assert_eq!(settings.ollama_library.verify_ssl, true); // default
+        assert!(settings.ollama_library.verify_ssl); // default
         assert_eq!(settings.ollama_library.timeout, 120.0); // default
         assert!(settings.ollama_library.download_chunks_in_parallel); // default
 
@@ -902,9 +902,9 @@ mod tests {
         let settings = result.unwrap();
         assert_eq!(settings.ollama_server.url, "http://test:9000/");
         assert_eq!(settings.ollama_server.api_key, Some("test_key".to_string()));
-        assert_eq!(settings.ollama_server.check_model_presence, false);
+        assert!(!settings.ollama_server.check_model_presence);
         assert_eq!(settings.ollama_library.timeout, 60.0);
-        assert_eq!(settings.ollama_library.verify_ssl, true); // default for missing field
+        assert!(settings.ollama_library.verify_ssl); // default for missing field
 
         fs::remove_file(test_file).unwrap();
     }
