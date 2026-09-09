@@ -61,26 +61,24 @@ impl TestSandbox {
             target_os = "android"
         ))]
         {
-            return self.xdg_data_home.join("odir");
+            self.xdg_data_home.join("odir")
         }
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            return self
-                .home_dir
+            self.home_dir
                 .join("Library")
                 .join("Application Support")
-                .join("odir");
+                .join("odir")
         }
 
         #[cfg(target_os = "windows")]
         {
-            return self
-                .home_dir
+            self.home_dir
                 .join("AppData")
                 .join("Local")
                 .join("odir")
-                .join("data");
+                .join("data")
         }
     }
 }

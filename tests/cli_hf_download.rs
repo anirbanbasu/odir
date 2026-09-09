@@ -248,7 +248,7 @@ fn test_hf_large_model_mode_indicator_non_interactive() {
         .clone();
     println!(
         "Captured output (truncated): {}",
-        &combined.chars().take(4000).collect::<String>()
+        combined.chars().take(4000).collect::<String>()
     );
 
     assert!(
@@ -359,13 +359,13 @@ fn test_hf_list_models_pagination() {
 
     // Test first page
     let output1 = std::process::Command::new(common::get_binary_path())
-        .args(&["hf-list-models", "--page", "1", "--page-size", "5"])
+        .args(["hf-list-models", "--page", "1", "--page-size", "5"])
         .output()
         .expect("Failed to execute hf-list-models command");
 
     // Test second page
     let output2 = std::process::Command::new(common::get_binary_path())
-        .args(&["hf-list-models", "--page", "2", "--page-size", "5"])
+        .args(["hf-list-models", "--page", "2", "--page-size", "5"])
         .output()
         .expect("Failed to execute hf-list-models command");
 
