@@ -127,6 +127,38 @@ impl Default for OllamaLibrary {
     }
 }
 
+/// Settings controlling automatic retrying of failed downloads.
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRetry {
+    /// Whether automatic retrying of failed downloads is enabled.
+    pub enabled: bool,
+
+    /// Maximum number of consecutive retries for the same download stage
+    /// before giving up. A "stage" is either the manifest fetch, an individual
+    /// blob, or the post-download finalisation (manifest save and presence
+    /// check). The counter resets whenever a failure occurs in a different
+    /// stage than the previous failure, since that indicates progress was made.
+    pub max_retries: u32,
+
+    /// Initial backoff delay in milliseconds before the first retry.
+    /// The delay doubles after each consecutive failure in the same stage.
+    pub initial_backoff_ms: u64,
+
+    /// Upper bound in milliseconds on the exponential backoff delay.
+    pub max_backoff_ms: u64,
+}
+
+impl Default for DownloadRetry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retries: 3,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 30_000,
+        }
+    }
+}
+
 fn default_models_path() -> String {
     BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".ollama").join("models"))
@@ -147,6 +179,9 @@ pub struct AppSettings {
 
     /// Settings for accessing the Ollama library and storing locally.
     pub ollama_library: OllamaLibrary,
+
+    /// Settings controlling automatic retrying of failed downloads.
+    pub download_retry: DownloadRetry,
 }
 
 impl AppSettings {
@@ -290,6 +325,39 @@ impl AppSettings {
         );
     }
 
+    fn fill_missing_download_retry_defaults(download_retry: &mut Map<String, Value>) {
+        let defaults = DownloadRetry::default();
+
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "enabled",
+            defaults.enabled.to_string(),
+            Value::Bool(defaults.enabled),
+        );
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "max_retries",
+            defaults.max_retries.to_string(),
+            Value::Number(serde_json::Number::from(defaults.max_retries)),
+        );
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "initial_backoff_ms",
+            defaults.initial_backoff_ms.to_string(),
+            Value::Number(serde_json::Number::from(defaults.initial_backoff_ms)),
+        );
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "max_backoff_ms",
+            defaults.max_backoff_ms.to_string(),
+            Value::Number(serde_json::Number::from(defaults.max_backoff_ms)),
+        );
+    }
+
     /// Validate all HTTP URLs in the settings.
     ///
     /// # Returns
@@ -307,17 +375,24 @@ impl AppSettings {
         Ok(())
     }
 
-    /// Load settings from the configuration file, or create default settings if the file does not exist.
-    /// If the file exists but has validation errors, attempts to repair it with defaults.
+    /// Load settings from the configuration file, or create default settings
+    /// if the file does not exist. If the file exists but has validation
+    /// errors, attempts to repair it with defaults. Also reports whether the
+    /// returned settings had fields missing from the file healed with
+    /// defaults, so callers can offer to persist the healed settings back to
+    /// disk (healing only applies in memory for the current load).
     ///
     /// # Arguments
     /// * `settings_file` - Path to the settings file
     ///
     /// # Returns
-    /// * `Result<Self, io::Error>` - The loaded or created settings
-    pub fn load_or_create_default<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
-        match Self::load_settings(&settings_file) {
-            Ok(settings) => Ok(settings),
+    /// * `Result<(Self, bool), io::Error>` - The loaded or created settings,
+    ///   and whether defaults were applied for missing fields.
+    pub fn load_or_create_default_reporting_healed<P: AsRef<Path>>(
+        settings_file: P,
+    ) -> io::Result<(Self, bool)> {
+        match Self::load_settings_impl(&settings_file) {
+            Ok(result) => Ok(result),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 info!(
                     "Settings file '{}' not found, creating one with default values",
@@ -328,7 +403,7 @@ impl AppSettings {
                     .validate_urls()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 settings.save_settings(&settings_file)?;
-                Ok(settings)
+                Ok((settings, false))
             }
             Err(e) => Err(e),
         }
@@ -342,13 +417,19 @@ impl AppSettings {
     /// # Returns
     /// * `Result<Self, io::Error>` - The loaded settings or an error
     pub fn load_settings<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
+        Self::load_settings_impl(settings_file).map(|(settings, _)| settings)
+    }
+
+    /// Load settings from the configuration file, reporting whether any
+    /// fields were missing and filled in with defaults (i.e. healed).
+    fn load_settings_impl<P: AsRef<Path>>(settings_file: P) -> io::Result<(Self, bool)> {
         let content = fs::read_to_string(settings_file)?;
         match serde_json::from_str::<AppSettings>(&content) {
             Ok(settings) => {
                 settings.validate_urls().map_err(|e: HttpUrlParseError| {
                     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                 })?;
-                Ok(settings)
+                Ok((settings, false))
             }
             Err(e) => {
                 // If deserialization fails, try lenient loading with defaults
@@ -356,15 +437,17 @@ impl AppSettings {
                     "Strict deserialization failed: {}. Attempting to load with defaults...",
                     e
                 );
-                Self::load_settings_lenient(&content).map_err(|lenient_err| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Failed strict deserialization: {}. Failed lenient deserialization: {}",
-                            e, lenient_err
-                        ),
-                    )
-                })
+                Self::load_settings_lenient(&content)
+                    .map(|settings| (settings, true))
+                    .map_err(|lenient_err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "Failed strict deserialization: {}. Failed lenient deserialization: {}",
+                                e, lenient_err
+                            ),
+                        )
+                    })
             }
         }
     }
@@ -397,10 +480,19 @@ impl AppSettings {
             .unwrap_or_default();
         Self::fill_missing_ollama_library_defaults(&mut ollama_library);
 
+        // Get or create the download_retry object
+        let mut download_retry = parsed
+            .get_mut("download_retry")
+            .and_then(|v| v.as_object_mut())
+            .map(|obj| obj.clone())
+            .unwrap_or_default();
+        Self::fill_missing_download_retry_defaults(&mut download_retry);
+
         // Reconstruct the settings object with filled-in values
         let settings_object = json!({
             "ollama_server": ollama_server,
             "ollama_library": ollama_library,
+            "download_retry": download_retry,
         });
 
         let settings: AppSettings = serde_json::from_value(settings_object)
@@ -736,6 +828,15 @@ mod tests {
     }
 
     #[test]
+    fn test_default_download_retry() {
+        let retry = DownloadRetry::default();
+        assert!(retry.enabled);
+        assert_eq!(retry.max_retries, 3);
+        assert_eq!(retry.initial_backoff_ms, 1000);
+        assert_eq!(retry.max_backoff_ms, 30_000);
+    }
+
+    #[test]
     fn test_save_and_load_settings() {
         let test_file = "target/test_settings.json";
 
@@ -770,8 +871,10 @@ mod tests {
         let _ = fs::remove_file(test_file);
 
         // Should create file with defaults when it doesn't exist
-        let settings = AppSettings::load_or_create_default(test_file).unwrap();
+        let (settings, healed) =
+            AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
         assert_eq!(settings.ollama_server.url, "http://localhost:11434/");
+        assert!(!healed);
         assert!(Path::new(test_file).exists());
 
         // Modify and save
@@ -780,8 +883,10 @@ mod tests {
         modified.save_settings(test_file).unwrap();
 
         // Should load existing file
-        let loaded = AppSettings::load_or_create_default(test_file).unwrap();
+        let (loaded, healed) =
+            AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
         assert_eq!(loaded.ollama_server.url, "http://modified:9999/");
+        assert!(!healed);
 
         // Clean up
         fs::remove_file(test_file).unwrap();
@@ -816,7 +921,7 @@ mod tests {
         init_test_logger();
         let test_file = "target/";
 
-        let result = AppSettings::load_or_create_default(test_file);
+        let result = AppSettings::load_or_create_default_reporting_healed(test_file);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::IsADirectory);
     }
@@ -842,6 +947,8 @@ mod tests {
             "ollama_server": {
             },
             "ollama_library": {
+            },
+            "download_retry": {
             }
         }"#;
         fs::write(test_file, json_with_missing_fields).unwrap();
@@ -870,6 +977,40 @@ mod tests {
         assert!(settings.ollama_library.verify_ssl); // default
         assert_eq!(settings.ollama_library.timeout, 120.0); // default
         assert!(settings.ollama_library.download_chunks_in_parallel); // default
+        assert!(settings.download_retry.enabled); // default
+        assert_eq!(settings.download_retry.max_retries, 3); // default
+        assert_eq!(settings.download_retry.initial_backoff_ms, 1000); // default
+        assert_eq!(settings.download_retry.max_backoff_ms, 30_000); // default
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_load_or_create_default_reporting_healed_reports_true_for_missing_fields() {
+        init_test_logger();
+        let test_file = "target/test_reporting_healed_missing_fields.json";
+        let json_with_missing_fields = r#"{
+            "ollama_server": {},
+            "ollama_library": {},
+            "download_retry": {}
+        }"#;
+        fs::write(test_file, json_with_missing_fields).unwrap();
+
+        let (settings, healed) =
+            AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
+        assert!(healed);
+        assert!(settings.download_retry.enabled);
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_load_or_create_default_reporting_healed_reports_false_for_complete_file() {
+        let test_file = "target/test_reporting_healed_complete_file.json";
+        AppSettings::default().save_settings(test_file).unwrap();
+
+        let (_, healed) = AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
+        assert!(!healed);
 
         fs::remove_file(test_file).unwrap();
     }

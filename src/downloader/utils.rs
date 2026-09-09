@@ -2,10 +2,10 @@
 //! including model presence checks, downloading blobs, saving manifests,
 //! and cleaning up temporary files.
 use crate::downloader::model_downloader::{
-    DownloaderError, Result, http_status_error_from_response,
+    DownloaderError, ModelDownloader, Result, http_status_error_from_response,
 };
 use crate::{
-    config::{AppSettings, get_journal_dir_path},
+    config::{AppSettings, DownloadRetry, get_journal_dir_path},
     downloader::manifest::{
         DownloadJournal, DownloadJournalItem, DownloadSourceType, JournalItemState,
     },
@@ -429,6 +429,155 @@ fn find_journal_for_model(
 
     found.sort_by_key(|(_, j)| j.updated_at);
     Ok(found.pop().expect("found is non-empty"))
+}
+
+// ─── Automatic retry with backoff ────────────────────────────────────────────
+
+/// Computes the journal identifier a [`ModelDownloader`] implementation uses
+/// internally for `model_identifier`, so retry logic can inspect the same
+/// journal entry the downloader itself writes to.
+fn journal_identifier_for_source(
+    source_type: &DownloadSourceType,
+    model_identifier: &str,
+) -> String {
+    match source_type {
+        // Mirrors the model:tag normalisation in `OllamaModelDownloader::download_model`.
+        DownloadSourceType::Ollama => {
+            if model_identifier.contains(':') {
+                model_identifier.to_string()
+            } else {
+                format!("{}:latest", model_identifier)
+            }
+        }
+        // `HuggingFaceModelDownloader::download_model` journals under the raw identifier.
+        DownloadSourceType::Hf => model_identifier.to_string(),
+    }
+}
+
+/// Identifies which stage of a download most recently failed, based on the
+/// advisory journal: the manifest fetch (no journal yet), a specific blob (an
+/// item not yet completed), or finalisation (all items completed, so the
+/// failure was in the manifest save or presence check).
+fn current_download_stage_key(
+    source_type: &DownloadSourceType,
+    journal_identifier: &str,
+) -> String {
+    match load_journal_for_model(journal_identifier, Some(source_type.clone())) {
+        Ok(journal) => match journal
+            .items
+            .iter()
+            .find(|item| !matches!(item.state, JournalItemState::Completed))
+        {
+            Some(item) => format!("item:{}", item.digest),
+            None => "finalize".to_string(),
+        },
+        Err(_) => "manifest".to_string(),
+    }
+}
+
+/// Whether a [`DownloaderError`] represents a plausibly transient failure
+/// worth retrying automatically. Parse, not-found and invalid-identifier
+/// errors are permanent conditions that retrying cannot fix. Among HTTP
+/// status errors, only server errors, 429 (Too Many Requests) and 408
+/// (Request Timeout) are treated as transient; other client errors (e.g. 404
+/// Not Found, 401 Unauthorized) will not succeed no matter how many times
+/// they are retried.
+fn is_retryable_download_error(error: &DownloaderError) -> bool {
+    match error {
+        DownloaderError::HttpError(_) | DownloaderError::IoError(_) => true,
+        DownloaderError::HttpStatus { status, .. } => {
+            status.is_server_error()
+                || *status == StatusCode::TOO_MANY_REQUESTS
+                || *status == StatusCode::REQUEST_TIMEOUT
+        }
+        _ => false,
+    }
+}
+
+/// Tracks retry attempts across the stages of a single resumable download, so
+/// a failure in a new stage (e.g. a different blob) gets a fresh retry budget
+/// instead of inheriting the attempt count of an unrelated earlier failure.
+#[derive(Debug, Default)]
+struct DownloadRetryTracker {
+    stage_key: Option<String>,
+    attempt: u32,
+}
+
+impl DownloadRetryTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a failure in `stage_key`. Returns the backoff duration to wait
+    /// before retrying, or `None` if the retry budget for this stage is
+    /// exhausted (or retries are disabled) and the caller should give up.
+    fn next_backoff(&mut self, stage_key: &str, settings: &DownloadRetry) -> Option<Duration> {
+        if !settings.enabled || settings.max_retries == 0 {
+            return None;
+        }
+
+        if self.stage_key.as_deref() == Some(stage_key) {
+            self.attempt += 1;
+        } else {
+            self.stage_key = Some(stage_key.to_string());
+            self.attempt = 0;
+        }
+
+        if self.attempt >= settings.max_retries {
+            return None;
+        }
+
+        let exponent = self.attempt.min(32);
+        let backoff_ms = settings
+            .initial_backoff_ms
+            .saturating_mul(2u64.saturating_pow(exponent))
+            .min(settings.max_backoff_ms);
+        Some(Duration::from_millis(backoff_ms))
+    }
+}
+
+/// Runs `downloader.download_model(model_identifier)`, automatically retrying
+/// with exponential backoff on transient failures according to
+/// `settings.download_retry`. The retry budget resets whenever a failure
+/// occurs in a different download stage than the previous failure (manifest
+/// fetch, a specific blob, or finalisation), so downloads that are genuinely
+/// making progress are not penalised for an unrelated earlier setback.
+///
+/// Retries are never attempted after a user-initiated interrupt (Ctrl+C) or
+/// for errors unlikely to be transient (see [`is_retryable_download_error`]).
+pub fn download_model_with_retry(
+    downloader: &dyn ModelDownloader,
+    model_identifier: &str,
+    source_type: DownloadSourceType,
+    settings: &AppSettings,
+) -> Result<bool> {
+    let journal_identifier = journal_identifier_for_source(&source_type, model_identifier);
+    let mut tracker = DownloadRetryTracker::new();
+
+    loop {
+        match downloader.download_model(model_identifier) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if crate::signal_handler::is_interrupted() || !is_retryable_download_error(&e) {
+                    return Err(e);
+                }
+
+                let stage_key = current_download_stage_key(&source_type, &journal_identifier);
+                match tracker.next_backoff(&stage_key, &settings.download_retry) {
+                    Some(backoff) => {
+                        println!(
+                            "Retrying after failure in stage '{}' (waiting {:.1}s): {}",
+                            stage_key,
+                            backoff.as_secs_f64(),
+                            e
+                        );
+                        thread::sleep(backoff);
+                    }
+                    None => return Err(e),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2150,6 +2299,7 @@ fn apply_ownership(path: &Path, ownership: Ownership) {
 mod tests {
     use super::*;
     use reqwest::blocking::Client;
+    use std::io;
     use std::io::Write;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Mutex, OnceLock};
@@ -2342,6 +2492,332 @@ mod tests {
         fs::write(&path, "{not-json").expect("write corrupt journal");
         let recovered = load_journal_or_recover(&path).expect("recover corrupt");
         assert!(recovered.is_none());
+    }
+
+    #[test]
+    fn test_journal_identifier_for_source() {
+        assert_eq!(
+            journal_identifier_for_source(&DownloadSourceType::Ollama, "llama3.1"),
+            "llama3.1:latest"
+        );
+        assert_eq!(
+            journal_identifier_for_source(&DownloadSourceType::Ollama, "llama3.1:8b"),
+            "llama3.1:8b"
+        );
+        assert_eq!(
+            journal_identifier_for_source(&DownloadSourceType::Hf, "user/repo"),
+            "user/repo"
+        );
+        assert_eq!(
+            journal_identifier_for_source(&DownloadSourceType::Hf, "user/repo:Q4_K_M"),
+            "user/repo:Q4_K_M"
+        );
+    }
+
+    #[test]
+    fn test_is_retryable_download_error() {
+        assert!(is_retryable_download_error(&DownloaderError::IoError(
+            io::Error::other("boom")
+        )));
+        assert!(is_retryable_download_error(&DownloaderError::HttpStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "server error".to_string(),
+        }));
+        assert!(is_retryable_download_error(&DownloaderError::HttpStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limited".to_string(),
+        }));
+        assert!(is_retryable_download_error(&DownloaderError::HttpStatus {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: "timed out".to_string(),
+        }));
+        assert!(!is_retryable_download_error(&DownloaderError::HttpStatus {
+            status: StatusCode::NOT_FOUND,
+            message: "not found".to_string(),
+        }));
+        assert!(!is_retryable_download_error(&DownloaderError::HttpStatus {
+            status: StatusCode::UNAUTHORIZED,
+            message: "unauthorized".to_string(),
+        }));
+        assert!(!is_retryable_download_error(
+            &DownloaderError::InvalidIdentifier("bad".to_string())
+        ));
+        assert!(!is_retryable_download_error(
+            &DownloaderError::ModelNotFound("missing".to_string())
+        ));
+        assert!(!is_retryable_download_error(&DownloaderError::Other(
+            "Download interrupted by user".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_current_download_stage_key() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let model = "stage-key-test:latest";
+        assert_eq!(
+            current_download_stage_key(&DownloadSourceType::Ollama, model),
+            "manifest"
+        );
+
+        let (path, mut journal) = initialize_or_reconcile_journal(
+            DownloadSourceType::Ollama,
+            model,
+            "latest",
+            vec![
+                DownloadJournalItem {
+                    digest: "sha256:aaa".to_string(),
+                    media_type: "application/test".to_string(),
+                    size: 1,
+                    state: JournalItemState::Pending,
+                    last_error: None,
+                },
+                DownloadJournalItem {
+                    digest: "sha256:bbb".to_string(),
+                    media_type: "application/test".to_string(),
+                    size: 1,
+                    state: JournalItemState::Pending,
+                    last_error: None,
+                },
+            ],
+            td.path().join("models").to_string_lossy().as_ref(),
+        )
+        .expect("init journal");
+
+        assert_eq!(
+            current_download_stage_key(&DownloadSourceType::Ollama, model),
+            "item:sha256:aaa"
+        );
+
+        update_journal_item_state(
+            &mut journal,
+            "sha256:aaa",
+            JournalItemState::Completed,
+            None,
+        );
+        write_journal_atomic(&path, &journal).expect("write journal");
+        assert_eq!(
+            current_download_stage_key(&DownloadSourceType::Ollama, model),
+            "item:sha256:bbb"
+        );
+
+        update_journal_item_state(
+            &mut journal,
+            "sha256:bbb",
+            JournalItemState::Completed,
+            None,
+        );
+        write_journal_atomic(&path, &journal).expect("write journal");
+        assert_eq!(
+            current_download_stage_key(&DownloadSourceType::Ollama, model),
+            "finalize"
+        );
+    }
+
+    #[test]
+    fn test_download_retry_tracker_resets_on_stage_change() {
+        let settings = DownloadRetry {
+            enabled: true,
+            max_retries: 2,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 1000,
+        };
+        let mut tracker = DownloadRetryTracker::new();
+
+        // First failure in "a": attempt 0 -> backoff of 10ms, budget remains.
+        let backoff = tracker.next_backoff("a", &settings).expect("should retry");
+        assert_eq!(backoff, Duration::from_millis(10));
+
+        // Second failure in "a": attempt 1 -> backoff doubles to 20ms.
+        let backoff = tracker.next_backoff("a", &settings).expect("should retry");
+        assert_eq!(backoff, Duration::from_millis(20));
+
+        // Third failure in "a": attempt 2 == max_retries -> exhausted.
+        assert!(tracker.next_backoff("a", &settings).is_none());
+
+        // Failure in a different stage "b" gets a fresh budget.
+        let backoff = tracker.next_backoff("b", &settings).expect("should retry");
+        assert_eq!(backoff, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_download_retry_tracker_caps_at_max_backoff() {
+        let settings = DownloadRetry {
+            enabled: true,
+            max_retries: 10,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 5000,
+        };
+        let mut tracker = DownloadRetryTracker::new();
+
+        for _ in 0..3 {
+            tracker.next_backoff("a", &settings);
+        }
+        let backoff = tracker.next_backoff("a", &settings).expect("should retry");
+        assert_eq!(backoff, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn test_download_retry_tracker_disabled_returns_none() {
+        let settings = DownloadRetry {
+            enabled: false,
+            max_retries: 3,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 1000,
+        };
+        let mut tracker = DownloadRetryTracker::new();
+        assert!(tracker.next_backoff("a", &settings).is_none());
+    }
+
+    #[test]
+    fn test_download_retry_tracker_zero_max_retries_returns_none() {
+        let settings = DownloadRetry {
+            enabled: true,
+            max_retries: 0,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 1000,
+        };
+        let mut tracker = DownloadRetryTracker::new();
+        assert!(tracker.next_backoff("a", &settings).is_none());
+    }
+
+    enum ScriptedOutcome {
+        Success,
+        Retryable,
+        Permanent,
+    }
+
+    struct ScriptedDownloader {
+        outcomes: Mutex<VecDeque<ScriptedOutcome>>,
+        calls: AtomicUsize,
+    }
+
+    impl ModelDownloader for ScriptedDownloader {
+        fn download_model(&self, _model_identifier: &str) -> Result<bool> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcomes.lock().expect("lock outcomes").pop_front() {
+                Some(ScriptedOutcome::Success) | None => Ok(true),
+                Some(ScriptedOutcome::Retryable) => {
+                    Err(DownloaderError::IoError(io::Error::other("transient boom")))
+                }
+                Some(ScriptedOutcome::Permanent) => Err(DownloaderError::InvalidIdentifier(
+                    "bad identifier".to_string(),
+                )),
+            }
+        }
+
+        fn list_available_models(
+            &self,
+            _page: Option<u32>,
+            _page_size: Option<u32>,
+        ) -> Result<Vec<String>> {
+            unimplemented!("not exercised by retry tests")
+        }
+
+        fn list_model_tags(&self, _model_identifier: &str) -> Result<Vec<String>> {
+            unimplemented!("not exercised by retry tests")
+        }
+    }
+
+    fn fast_retry_settings(max_retries: u32) -> AppSettings {
+        let mut settings = AppSettings::default();
+        settings.download_retry = DownloadRetry {
+            enabled: true,
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+        };
+        settings
+    }
+
+    #[test]
+    fn test_download_model_with_retry_succeeds_after_transient_failures() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let downloader = ScriptedDownloader {
+            outcomes: Mutex::new(VecDeque::from([
+                ScriptedOutcome::Retryable,
+                ScriptedOutcome::Retryable,
+                ScriptedOutcome::Success,
+            ])),
+            calls: AtomicUsize::new(0),
+        };
+        let settings = fast_retry_settings(5);
+
+        let result = download_model_with_retry(
+            &downloader,
+            "retry-success:latest",
+            DownloadSourceType::Ollama,
+            &settings,
+        );
+
+        assert!(result.expect("should eventually succeed"));
+        assert_eq!(downloader.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_download_model_with_retry_gives_up_immediately_on_permanent_error() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        let downloader = ScriptedDownloader {
+            outcomes: Mutex::new(VecDeque::from([ScriptedOutcome::Permanent])),
+            calls: AtomicUsize::new(0),
+        };
+        let settings = fast_retry_settings(5);
+
+        let result = download_model_with_retry(
+            &downloader,
+            "retry-permanent:latest",
+            DownloadSourceType::Ollama,
+            &settings,
+        );
+
+        assert!(matches!(result, Err(DownloaderError::InvalidIdentifier(_))));
+        assert_eq!(downloader.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_download_model_with_retry_exhausts_budget_for_stuck_stage() {
+        let _guard = env_lock().lock().expect("lock");
+        let td = tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("HOME", td.path());
+        }
+
+        // No journal is ever written for this model, so every failure is
+        // classified as the same "manifest" stage and the retry budget for
+        // that stage should be exhausted after `max_retries` attempts.
+        let downloader = ScriptedDownloader {
+            outcomes: Mutex::new(VecDeque::from([
+                ScriptedOutcome::Retryable,
+                ScriptedOutcome::Retryable,
+                ScriptedOutcome::Retryable,
+            ])),
+            calls: AtomicUsize::new(0),
+        };
+        let settings = fast_retry_settings(2);
+
+        let result = download_model_with_retry(
+            &downloader,
+            "retry-stuck:latest",
+            DownloadSourceType::Ollama,
+            &settings,
+        );
+
+        assert!(matches!(result, Err(DownloaderError::IoError(_))));
+        assert_eq!(downloader.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
