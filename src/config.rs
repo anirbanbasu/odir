@@ -127,6 +127,38 @@ impl Default for OllamaLibrary {
     }
 }
 
+/// Settings controlling automatic retrying of failed downloads.
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRetry {
+    /// Whether automatic retrying of failed downloads is enabled.
+    pub enabled: bool,
+
+    /// Maximum number of consecutive retries for the same download stage
+    /// before giving up. A "stage" is either the manifest fetch, an individual
+    /// blob, or the post-download finalisation (manifest save and presence
+    /// check). The counter resets whenever a failure occurs in a different
+    /// stage than the previous failure, since that indicates progress was made.
+    pub max_retries: u32,
+
+    /// Initial backoff delay in milliseconds before the first retry.
+    /// The delay doubles after each consecutive failure in the same stage.
+    pub initial_backoff_ms: u64,
+
+    /// Upper bound in milliseconds on the exponential backoff delay.
+    pub max_backoff_ms: u64,
+}
+
+impl Default for DownloadRetry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retries: 3,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 30_000,
+        }
+    }
+}
+
 fn default_models_path() -> String {
     BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".ollama").join("models"))
@@ -147,6 +179,9 @@ pub struct AppSettings {
 
     /// Settings for accessing the Ollama library and storing locally.
     pub ollama_library: OllamaLibrary,
+
+    /// Settings controlling automatic retrying of failed downloads.
+    pub download_retry: DownloadRetry,
 }
 
 impl AppSettings {
@@ -290,6 +325,39 @@ impl AppSettings {
         );
     }
 
+    fn fill_missing_download_retry_defaults(download_retry: &mut Map<String, Value>) {
+        let defaults = DownloadRetry::default();
+
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "enabled",
+            defaults.enabled.to_string(),
+            Value::Bool(defaults.enabled),
+        );
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "max_retries",
+            defaults.max_retries.to_string(),
+            Value::Number(serde_json::Number::from(defaults.max_retries)),
+        );
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "initial_backoff_ms",
+            defaults.initial_backoff_ms.to_string(),
+            Value::Number(serde_json::Number::from(defaults.initial_backoff_ms)),
+        );
+        Self::insert_default_if_missing(
+            download_retry,
+            "download_retry",
+            "max_backoff_ms",
+            defaults.max_backoff_ms.to_string(),
+            Value::Number(serde_json::Number::from(defaults.max_backoff_ms)),
+        );
+    }
+
     /// Validate all HTTP URLs in the settings.
     ///
     /// # Returns
@@ -397,10 +465,19 @@ impl AppSettings {
             .unwrap_or_default();
         Self::fill_missing_ollama_library_defaults(&mut ollama_library);
 
+        // Get or create the download_retry object
+        let mut download_retry = parsed
+            .get_mut("download_retry")
+            .and_then(|v| v.as_object_mut())
+            .map(|obj| obj.clone())
+            .unwrap_or_default();
+        Self::fill_missing_download_retry_defaults(&mut download_retry);
+
         // Reconstruct the settings object with filled-in values
         let settings_object = json!({
             "ollama_server": ollama_server,
             "ollama_library": ollama_library,
+            "download_retry": download_retry,
         });
 
         let settings: AppSettings = serde_json::from_value(settings_object)
@@ -736,6 +813,15 @@ mod tests {
     }
 
     #[test]
+    fn test_default_download_retry() {
+        let retry = DownloadRetry::default();
+        assert!(retry.enabled);
+        assert_eq!(retry.max_retries, 3);
+        assert_eq!(retry.initial_backoff_ms, 1000);
+        assert_eq!(retry.max_backoff_ms, 30_000);
+    }
+
+    #[test]
     fn test_save_and_load_settings() {
         let test_file = "target/test_settings.json";
 
@@ -842,6 +928,8 @@ mod tests {
             "ollama_server": {
             },
             "ollama_library": {
+            },
+            "download_retry": {
             }
         }"#;
         fs::write(test_file, json_with_missing_fields).unwrap();
@@ -870,6 +958,10 @@ mod tests {
         assert!(settings.ollama_library.verify_ssl); // default
         assert_eq!(settings.ollama_library.timeout, 120.0); // default
         assert!(settings.ollama_library.download_chunks_in_parallel); // default
+        assert!(settings.download_retry.enabled); // default
+        assert_eq!(settings.download_retry.max_retries, 3); // default
+        assert_eq!(settings.download_retry.initial_backoff_ms, 1000); // default
+        assert_eq!(settings.download_retry.max_backoff_ms, 30_000); // default
 
         fs::remove_file(test_file).unwrap();
     }

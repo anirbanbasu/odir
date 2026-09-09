@@ -10,8 +10,8 @@ pub enum DownloaderError {
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
 
-    #[error("HTTP request failed: {0}")]
-    HttpStatus(String),
+    #[error("HTTP request failed: {message}")]
+    HttpStatus { status: StatusCode, message: String },
 
     #[error("Failed to parse HTML: {0}")]
     ParseError(String),
@@ -37,11 +37,10 @@ pub fn http_status_error_from_response(response: Response) -> DownloaderError {
     let body = response.text().ok();
     let summarized_body = summarize_http_error_body(body.as_deref());
 
-    DownloaderError::HttpStatus(format_http_status_error(
+    DownloaderError::HttpStatus {
         status,
-        &url,
-        summarized_body.as_deref(),
-    ))
+        message: format_http_status_error(status, &url, summarized_body.as_deref()),
+    }
 }
 
 fn format_http_status_error(status: StatusCode, url: &str, body: Option<&str>) -> String {

@@ -84,11 +84,17 @@ Let's explore the configuration in details. The default content is as follows.
         "transient_ttl_hours": 72,
         "failed_journal_ttl_hours": 168,
         "completed_journal_ttl_hours": 24
+    },
+    "download_retry": {
+        "enabled": true,
+        "max_retries": 3,
+        "initial_backoff_ms": 1000,
+        "max_backoff_ms": 30000
     }
 }
 ```
 
-There are two main configuration groups: `ollama_server` and `ollama_library`. The former refers to the server for which you wish to download the model. The latter refers to the Ollama library where the model and related information ought to be downloaded from.
+There are three main configuration groups: `ollama_server`, `ollama_library`, and `download_retry`. The first refers to the server for which you wish to download the model. The second refers to the Ollama library where the model and related information ought to be downloaded from. The third controls automatic retrying of failed downloads.
 
 ### `ollama_server`
 
@@ -111,6 +117,17 @@ There are two main configuration groups: `ollama_server` and `ollama_library`. T
 - The `transient_ttl_hours` controls the age threshold (in hours) used to remove stale transient files such as chunk work files under `.parts`. Default is `72`.
 - The `failed_journal_ttl_hours` controls how long failed/incomplete journal files are kept before cleanup. Default is `168`.
 - The `completed_journal_ttl_hours` controls how long completed journal files are kept before cleanup. Default is `24`.
+
+### `download_retry`
+
+ODIR resumes interrupted downloads on the next run, but it can also retry a failed download automatically within the same run before giving up.
+
+- The `enabled` flag turns automatic retrying on or off. Default is `true`.
+- The `max_retries` controls how many consecutive retries are allowed for the same download stage (the manifest fetch, an individual blob, or the post-download finalisation step) before ODIR gives up. Default is `3`.
+- The `initial_backoff_ms` is the delay, in milliseconds, before the first retry. The delay doubles after each consecutive failure in the same stage, up to `max_backoff_ms`. Default is `1000` (1 second).
+- The `max_backoff_ms` caps the exponential backoff delay. Default is `30000` (30 seconds).
+
+The retry budget resets whenever a failure occurs in a different stage than the previous failure, since that indicates the download is making progress rather than being stuck. For example, if downloading one blob fails twice and then succeeds, and a _different_ blob subsequently fails, that failure gets a fresh set of retries rather than inheriting the attempt count from the earlier blob. Only failures considered plausibly transient (network errors, server errors, HTTP 429 Too Many Requests, and HTTP 408 Request Timeout) are retried automatically; permanent failures such as an invalid model identifier or an HTTP 404 Not Found are reported immediately.
 
 ### Journal diagnostics
 

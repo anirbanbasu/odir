@@ -15,7 +15,10 @@ use config::{AppSettings, Config};
 
 mod downloader;
 use downloader::manifest::{DownloadJournal, DownloadJournalListEntry, DownloadSourceType};
-use downloader::utils::{clear_journal_for_model, list_available_journals, load_journal_for_model};
+use downloader::utils::{
+    clear_journal_for_model, download_model_with_retry, list_available_journals,
+    load_journal_for_model,
+};
 use downloader::{HuggingFaceModelDownloader, ModelDownloader, OllamaModelDownloader};
 
 mod signal_handler;
@@ -272,6 +275,52 @@ fn prompt_f64(prompt: &str, default: f64) -> f64 {
     }
 }
 
+/// Prompts the user for a free-form u32 value with a default value.
+fn prompt_u32(prompt: &str, default: u32) -> u32 {
+    loop {
+        print!("{} [{}]: ", prompt, default);
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let input = input.trim();
+
+        if input.is_empty() {
+            return default;
+        }
+
+        match input.parse::<u32>() {
+            Ok(value) => return value,
+            Err(_) => {
+                println!("Invalid number. Please try again.");
+            }
+        }
+    }
+}
+
+/// Prompts the user for a free-form u64 value with a default value.
+fn prompt_u64(prompt: &str, default: u64) -> u64 {
+    loop {
+        print!("{} [{}]: ", prompt, default);
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let input = input.trim();
+
+        if input.is_empty() {
+            return default;
+        }
+
+        match input.parse::<u64>() {
+            Ok(value) => return value,
+            Err(_) => {
+                println!("Invalid number. Please try again.");
+            }
+        }
+    }
+}
+
 /// Prompts the user for a u64 value chosen from a fixed list of allowed values.
 fn prompt_u64_choice(prompt: &str, default: u64, allowed: &[u64]) -> u64 {
     loop {
@@ -409,6 +458,28 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
         "Completed journal TTL (hours)",
         settings.ollama_library.completed_journal_ttl_hours,
         &[0, 12, 24, 48, 72, 168],
+    );
+
+    // Download retry settings
+    println!("\n--- Download Retry Settings ---");
+    settings.download_retry.enabled = prompt_bool(
+        "Automatically retry failed downloads?",
+        settings.download_retry.enabled,
+    );
+
+    settings.download_retry.max_retries = prompt_u32(
+        "Maximum consecutive retries per download stage",
+        settings.download_retry.max_retries,
+    );
+
+    settings.download_retry.initial_backoff_ms = prompt_u64(
+        "Initial retry backoff delay (milliseconds)",
+        settings.download_retry.initial_backoff_ms,
+    );
+
+    settings.download_retry.max_backoff_ms = prompt_u64(
+        "Maximum retry backoff delay (milliseconds)",
+        settings.download_retry.max_backoff_ms,
     );
 
     println!("\n=== Configuration Complete ===\n");
@@ -570,8 +641,13 @@ fn handle_list_tags(model_identifier: String) {
 
 fn handle_model_download(model_tag: String) {
     match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-        Ok(settings) => match OllamaModelDownloader::new(settings) {
-            Ok(downloader) => match downloader.download_model(&model_tag) {
+        Ok(settings) => match OllamaModelDownloader::new(settings.clone()) {
+            Ok(downloader) => match download_model_with_retry(
+                &downloader,
+                &model_tag,
+                DownloadSourceType::Ollama,
+                &settings,
+            ) {
                 Ok(_) => {
                     println!("Model {} download completed successfully", model_tag);
                     signal_handler::set_cleanup_done();
@@ -654,8 +730,13 @@ fn handle_hf_list_tags(model_identifier: String) {
 
 fn handle_hf_model_download(user_repo_quant: String) {
     match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-        Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
-            Ok(downloader) => match downloader.download_model(&user_repo_quant) {
+        Ok(settings) => match HuggingFaceModelDownloader::new(settings.clone()) {
+            Ok(downloader) => match download_model_with_retry(
+                &downloader,
+                &user_repo_quant,
+                DownloadSourceType::Hf,
+                &settings,
+            ) {
                 Ok(_) => {
                     println!(
                         "HuggingFace model {} download completed successfully",
