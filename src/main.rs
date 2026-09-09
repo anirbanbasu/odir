@@ -7,7 +7,7 @@ use chrono::{Local, TimeZone};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::{debug, error, info, warn};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 mod config;
@@ -486,8 +486,47 @@ fn interactive_config(existing_settings: Option<AppSettings>) -> AppSettings {
     settings
 }
 
+/// Whether to offer saving healed settings back to disk: only when
+/// something was actually healed, and only when stdin is an interactive
+/// terminal, so unattended invocations (e.g. cron jobs or scripts) are never
+/// blocked on a prompt nobody is there to answer.
+fn should_offer_to_save_healed_settings(healed: bool, stdin_is_terminal: bool) -> bool {
+    healed && stdin_is_terminal
+}
+
+/// Loads application settings for a CLI command. If the settings file was
+/// missing fields that got healed with defaults, and stdin is an interactive
+/// terminal, offers to persist the healed settings back to disk so future
+/// runs don't need to re-heal (and re-warn) every time.
+fn load_settings_for_command() -> io::Result<AppSettings> {
+    let settings_path = config::get_settings_file_path_or_panic();
+    let (settings, healed) = AppSettings::load_or_create_default_reporting_healed(&settings_path)?;
+
+    if should_offer_to_save_healed_settings(healed, io::stdin().is_terminal()) {
+        println!(
+            "\n⚠ Some fields were missing from '{}' and defaults were applied for this run.",
+            settings_path.display()
+        );
+        if prompt_bool(
+            "Save the healed settings back to the configuration file?",
+            true,
+        ) {
+            match settings.save_settings(&settings_path) {
+                Ok(_) => println!("Saved healed settings to: {}\n", settings_path.display()),
+                Err(e) => warn!(
+                    "Failed to save healed settings to '{}': {}",
+                    settings_path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
+    Ok(settings)
+}
+
 fn handle_show_config() {
-    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+    match load_settings_for_command() {
         Ok(settings) => match serde_json::to_string_pretty(&settings) {
             Ok(json) => {
                 println!("{}", json);
@@ -583,7 +622,7 @@ fn handle_edit_config(config_file: Option<String>) {
 }
 
 fn handle_list_models(page: Option<u32>, page_size: Option<u32>) {
-    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+    match load_settings_for_command() {
         Ok(settings) => match OllamaModelDownloader::new(settings) {
             Ok(downloader) => match downloader.list_available_models(page, page_size) {
                 Ok(models) => {
@@ -616,7 +655,7 @@ fn handle_list_models(page: Option<u32>, page_size: Option<u32>) {
 }
 
 fn handle_list_tags(model_identifier: String) {
-    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+    match load_settings_for_command() {
         Ok(settings) => match OllamaModelDownloader::new(settings) {
             Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
                 Ok(tags) => {
@@ -640,7 +679,7 @@ fn handle_list_tags(model_identifier: String) {
 }
 
 fn handle_model_download(model_tag: String) {
-    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+    match load_settings_for_command() {
         Ok(settings) => match OllamaModelDownloader::new(settings.clone()) {
             Ok(downloader) => match download_model_with_retry(
                 &downloader,
@@ -673,7 +712,7 @@ fn handle_model_download(model_tag: String) {
 }
 
 fn handle_hf_list_models(page: u32, page_size: u32) {
-    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+    match load_settings_for_command() {
         Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
             Ok(downloader) => match downloader.list_available_models(Some(page), Some(page_size)) {
                 Ok(models) => {
@@ -702,7 +741,7 @@ fn handle_hf_list_models(page: u32, page_size: u32) {
 }
 
 fn handle_hf_list_tags(model_identifier: String) {
-    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+    match load_settings_for_command() {
         Ok(settings) => match HuggingFaceModelDownloader::new(settings) {
             Ok(downloader) => match downloader.list_model_tags(&model_identifier) {
                 Ok(tags) => {
@@ -729,7 +768,7 @@ fn handle_hf_list_tags(model_identifier: String) {
 }
 
 fn handle_hf_model_download(user_repo_quant: String) {
-    match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
+    match load_settings_for_command() {
         Ok(settings) => match HuggingFaceModelDownloader::new(settings.clone()) {
             Ok(downloader) => match download_model_with_retry(
                 &downloader,
@@ -945,14 +984,13 @@ fn handle_journal_clear(model_identifier: &str, journal: &DownloadJournal) {
         return;
     }
 
-    let settings =
-        match AppSettings::load_or_create_default(config::get_settings_file_path_or_panic()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to load settings for journal clear: {}", e);
-                std::process::exit(1);
-            }
-        };
+    let settings = match load_settings_for_command() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to load settings for journal clear: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     match clear_journal_for_model(
         model_identifier,
@@ -1121,5 +1159,18 @@ fn main() {
             clear,
             json,
         } => handle_journal(model_identifier, list, source, clear, json),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_offer_to_save_healed_settings() {
+        assert!(should_offer_to_save_healed_settings(true, true));
+        assert!(!should_offer_to_save_healed_settings(true, false));
+        assert!(!should_offer_to_save_healed_settings(false, true));
+        assert!(!should_offer_to_save_healed_settings(false, false));
     }
 }

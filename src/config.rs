@@ -375,17 +375,24 @@ impl AppSettings {
         Ok(())
     }
 
-    /// Load settings from the configuration file, or create default settings if the file does not exist.
-    /// If the file exists but has validation errors, attempts to repair it with defaults.
+    /// Load settings from the configuration file, or create default settings
+    /// if the file does not exist. If the file exists but has validation
+    /// errors, attempts to repair it with defaults. Also reports whether the
+    /// returned settings had fields missing from the file healed with
+    /// defaults, so callers can offer to persist the healed settings back to
+    /// disk (healing only applies in memory for the current load).
     ///
     /// # Arguments
     /// * `settings_file` - Path to the settings file
     ///
     /// # Returns
-    /// * `Result<Self, io::Error>` - The loaded or created settings
-    pub fn load_or_create_default<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
-        match Self::load_settings(&settings_file) {
-            Ok(settings) => Ok(settings),
+    /// * `Result<(Self, bool), io::Error>` - The loaded or created settings,
+    ///   and whether defaults were applied for missing fields.
+    pub fn load_or_create_default_reporting_healed<P: AsRef<Path>>(
+        settings_file: P,
+    ) -> io::Result<(Self, bool)> {
+        match Self::load_settings_impl(&settings_file) {
+            Ok(result) => Ok(result),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 info!(
                     "Settings file '{}' not found, creating one with default values",
@@ -396,7 +403,7 @@ impl AppSettings {
                     .validate_urls()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 settings.save_settings(&settings_file)?;
-                Ok(settings)
+                Ok((settings, false))
             }
             Err(e) => Err(e),
         }
@@ -410,13 +417,19 @@ impl AppSettings {
     /// # Returns
     /// * `Result<Self, io::Error>` - The loaded settings or an error
     pub fn load_settings<P: AsRef<Path>>(settings_file: P) -> io::Result<Self> {
+        Self::load_settings_impl(settings_file).map(|(settings, _)| settings)
+    }
+
+    /// Load settings from the configuration file, reporting whether any
+    /// fields were missing and filled in with defaults (i.e. healed).
+    fn load_settings_impl<P: AsRef<Path>>(settings_file: P) -> io::Result<(Self, bool)> {
         let content = fs::read_to_string(settings_file)?;
         match serde_json::from_str::<AppSettings>(&content) {
             Ok(settings) => {
                 settings.validate_urls().map_err(|e: HttpUrlParseError| {
                     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                 })?;
-                Ok(settings)
+                Ok((settings, false))
             }
             Err(e) => {
                 // If deserialization fails, try lenient loading with defaults
@@ -424,15 +437,17 @@ impl AppSettings {
                     "Strict deserialization failed: {}. Attempting to load with defaults...",
                     e
                 );
-                Self::load_settings_lenient(&content).map_err(|lenient_err| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Failed strict deserialization: {}. Failed lenient deserialization: {}",
-                            e, lenient_err
-                        ),
-                    )
-                })
+                Self::load_settings_lenient(&content)
+                    .map(|settings| (settings, true))
+                    .map_err(|lenient_err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "Failed strict deserialization: {}. Failed lenient deserialization: {}",
+                                e, lenient_err
+                            ),
+                        )
+                    })
             }
         }
     }
@@ -856,8 +871,10 @@ mod tests {
         let _ = fs::remove_file(test_file);
 
         // Should create file with defaults when it doesn't exist
-        let settings = AppSettings::load_or_create_default(test_file).unwrap();
+        let (settings, healed) =
+            AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
         assert_eq!(settings.ollama_server.url, "http://localhost:11434/");
+        assert!(!healed);
         assert!(Path::new(test_file).exists());
 
         // Modify and save
@@ -866,8 +883,10 @@ mod tests {
         modified.save_settings(test_file).unwrap();
 
         // Should load existing file
-        let loaded = AppSettings::load_or_create_default(test_file).unwrap();
+        let (loaded, healed) =
+            AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
         assert_eq!(loaded.ollama_server.url, "http://modified:9999/");
+        assert!(!healed);
 
         // Clean up
         fs::remove_file(test_file).unwrap();
@@ -902,7 +921,7 @@ mod tests {
         init_test_logger();
         let test_file = "target/";
 
-        let result = AppSettings::load_or_create_default(test_file);
+        let result = AppSettings::load_or_create_default_reporting_healed(test_file);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::IsADirectory);
     }
@@ -962,6 +981,36 @@ mod tests {
         assert_eq!(settings.download_retry.max_retries, 3); // default
         assert_eq!(settings.download_retry.initial_backoff_ms, 1000); // default
         assert_eq!(settings.download_retry.max_backoff_ms, 30_000); // default
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_load_or_create_default_reporting_healed_reports_true_for_missing_fields() {
+        init_test_logger();
+        let test_file = "target/test_reporting_healed_missing_fields.json";
+        let json_with_missing_fields = r#"{
+            "ollama_server": {},
+            "ollama_library": {},
+            "download_retry": {}
+        }"#;
+        fs::write(test_file, json_with_missing_fields).unwrap();
+
+        let (settings, healed) =
+            AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
+        assert!(healed);
+        assert!(settings.download_retry.enabled);
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_load_or_create_default_reporting_healed_reports_false_for_complete_file() {
+        let test_file = "target/test_reporting_healed_complete_file.json";
+        AppSettings::default().save_settings(test_file).unwrap();
+
+        let (_, healed) = AppSettings::load_or_create_default_reporting_healed(test_file).unwrap();
+        assert!(!healed);
 
         fs::remove_file(test_file).unwrap();
     }
